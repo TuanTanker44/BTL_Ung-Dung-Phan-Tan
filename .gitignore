@@ -1,3 +1,4 @@
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -37,3 +38,6 @@ ingestion/generated/
 # OS metadata
 .DS_Store
 Thumbs.db
+
+# Database backups
+backups/

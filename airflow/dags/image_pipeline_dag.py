@@ -1,45 +1,55 @@
+
 from datetime import datetime, timedelta
+
 from airflow import DAG
 from airflow.operators.bash import BashOperator
 
-# Default arguments for Airflow DAG
+
 default_args = {
-    'owner': 'data_engineer',
-    'depends_on_past': False,
-    'email_on_failure': False,
-    'email_on_retry': False,
-    'retries': 1,
-    'retry_delay': timedelta(minutes=2),
+    "owner": "data_engineer",
+    "depends_on_past": False,
+    "email_on_failure": False,
+    "email_on_retry": False,
+    "retries": 1,
+    "retry_delay": timedelta(minutes=2),
 }
 
-# Define DAG
+
 with DAG(
-    'distributed_image_classification_pipeline',
+    dag_id="distributed_image_classification_pipeline",
     default_args=default_args,
-    description='Orchestrates PySpark classification job utilizing VGG16 and loading results to ClickHouse',
-    schedule_interval=None,  # Scheduled manually or via trigger for testing, can be set to e.g. '*/5 * * * *'
+    description=(
+        "Orchestrates distributed traffic image processing "
+        "using Spark Cluster and YOLOv8/Mock, "
+        "with results stored in ClickHouse"
+    ),
+    schedule_interval=None,
     start_date=datetime(2026, 1, 1),
     catchup=False,
-    tags=['image_pipeline', 'spark', 'vgg16', 'clickhouse'],
+    max_active_runs=1,
+    max_active_tasks=1,
+    tags=[
+        "traffic_monitoring",
+        "spark",
+        "yolov8",
+        "clickhouse",
+    ],
 ) as dag:
 
-    # Execute the Spark Job using Python in the Airflow environment
-    # The spark volume is mapped to /opt/spark-jobs in docker-compose
     run_spark_classification = BashOperator(
-        task_id='run_spark_classification_job',
-        bash_command='python /opt/spark-jobs/spark_job.py',
-        env={
-            'MINIO_ENDPOINT': 'minio:9000',
-            'MINIO_ACCESS_KEY': 'minioadmin',
-            'MINIO_SECRET_KEY': 'minioadmin',
-            'RABBITMQ_HOST': 'rabbitmq',
-            'RABBITMQ_USER': 'guest',
-            'RABBITMQ_PASS': 'guest',
-            'RABBITMQ_QUEUE': 'image_processing_queue',
-            'CLICKHOUSE_HOST': 'clickhouse',
-            'CLICKHOUSE_PORT': '8123',
-            'CLICKHOUSE_DB': 'image_dw'
-        }
-    )
+        task_id="run_spark_classification_job",
+        bash_command="""
+set -e
 
-    run_spark_classification
+"$SPARK_HOME/bin/spark-submit" \
+  --master "$SPARK_MASTER_URL" \
+  --deploy-mode client \
+  --driver-memory 1g \
+  --executor-memory 1g \
+  --executor-cores 1 \
+  --total-executor-cores 2 \
+  --conf spark.pyspark.python=/opt/bitnami/python/bin/python \
+  --conf spark.pyspark.driver.python=/home/airflow/spark-venv/bin/python \
+  /opt/spark-jobs/spark_job.py
+""",
+    )
