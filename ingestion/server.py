@@ -6,6 +6,7 @@ import logging
 from concurrent import futures
 from datetime import datetime
 import io
+import time
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -108,6 +109,31 @@ class ImageIngestionService(image_ingestion_pb2_grpc.ImageIngestionServiceServic
             logger.error(f"Failed to connect/declare RabbitMQ queue: {e}")
             raise e
 
+    def _publish_event(self, payload, retries=3):
+        last_err = None
+        for attempt in range(1, retries + 1):
+            try:
+                with pika.BlockingConnection(self.rabbitmq_params) as connection:
+                    channel = connection.channel()
+                    channel.confirm_delivery()  # broker xác nhận đã nhận tin
+                    channel.basic_publish(
+                        exchange="",
+                        routing_key=QUEUE_NAME,
+                        body=json.dumps(payload),
+                        properties=pika.BasicProperties(
+                            delivery_mode=2,  # tin nhắn bền vững
+                            content_type="application/json",
+                        ),
+                        mandatory=True,
+                    )
+                return
+            except Exception as e:
+                last_err = e
+                logger.warning(f"Publish attempt {attempt}/{retries} failed: {e}")
+                time.sleep(0.5 * attempt)
+        raise last_err
+
+
     def UploadImage(self, request, context):
         image_id = str(uuid.uuid4())
         event_id = str(uuid.uuid4())
@@ -160,30 +186,23 @@ class ImageIngestionService(image_ingestion_pb2_grpc.ImageIngestionServiceServic
         }
 
         try:
-            connection = pika.BlockingConnection(self.rabbitmq_params)
-            channel = connection.channel()
-            channel.basic_publish(
-                exchange="",
-                routing_key=QUEUE_NAME,
-                body=json.dumps(event_payload),
-                properties=pika.BasicProperties(
-                    delivery_mode=2,  # make message persistent
-                    content_type='application/json'
-                )
-            )
-            connection.close()
+            self._publish_event(event_payload)
             logger.info(f"Published ingestion event to RabbitMQ for image: {image_id}")
         except Exception as e:
             logger.error(f"Failed to publish event to RabbitMQ for image {image_id}: {e}")
-            # If RabbitMQ fails, we have an inconsistency, but for now log it and raise error
-            context.set_code(grpc.StatusCode.INTERNAL)
+            # Bù trừ: xóa ảnh mồ côi để MinIO và RabbitMQ luôn nhất quán
+            try:
+                self.minio_client.remove_object(BUCKET_NAME, s3_key)
+                logger.info(f"Rolled back MinIO object: {s3_key}")
+            except Exception as cleanup_err:
+                logger.error(f"Cleanup failed for {s3_key}: {cleanup_err}")
+            context.set_code(grpc.StatusCode.UNAVAILABLE)
             context.set_details(f"RabbitMQ Publish Error: {str(e)}")
             return image_ingestion_pb2.ImageUploadResponse(
-                image_id=image_id,
-                s3_uri=s3_uri,
-                status="PARTIAL_SUCCESS",
-                message=f"Uploaded to MinIO, but failed to queue processing: {str(e)}"
+                status="FAILED",
+                message="Queue unavailable, please retry."
             )
+            
 
         # 3. Return response
         return image_ingestion_pb2.ImageUploadResponse(
