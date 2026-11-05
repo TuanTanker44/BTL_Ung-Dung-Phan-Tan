@@ -26,7 +26,7 @@ sleep 10
 
 # 4. Cài đặt thư viện trong Spark Master
 echo -e "\n\033[0;34m4. Cài đặt các thư viện cần thiết vào Spark Master container...\033[0m"
-docker exec -u 0 -t image_pipeline_spark_master pip install minio pika clickhouse-connect Pillow
+docker exec -u 0 -t image_pipeline_spark_master pip install -r /opt/spark-jobs/requirements.txt
 if [ $? -ne 0 ]; then
     echo -e "\033[0;31m❌ Thất bại khi cài đặt thư viện vào Spark container.\033[0m"
 else

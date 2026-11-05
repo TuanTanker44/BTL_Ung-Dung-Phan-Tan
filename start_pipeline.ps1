@@ -28,7 +28,7 @@ Start-Sleep -Seconds 10
 
 # 4. Cài đặt thư viện Python trong Spark Master
 Write-Host "`n4. Cài đặt các thư viện cần thiết vào Spark Master container..." -ForegroundColor Blue
-docker exec -u 0 -t image_pipeline_spark_master pip install minio pika clickhouse-connect Pillow
+docker exec -u 0 -t image_pipeline_spark_master pip install -r /opt/spark-jobs/requirements.txt
 if ($LASTEXITCODE -ne 0) {
     Write-Host "❌ Thất bại khi cài đặt thư viện vào Spark container." -ForegroundColor Red
 } else {
