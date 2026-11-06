@@ -1,3 +1,4 @@
+
 services:
   # --- Message Broker ---
   rabbitmq:
@@ -54,11 +55,25 @@ services:
 
   # --- Apache Spark Cluster ---
   spark-master:
-    image: bitnamilegacy/spark:3.4.1
+    build:
+      context: .
+      dockerfile: spark/Dockerfile
+    image: traffic-spark:3.4.1
     container_name: image_pipeline_spark_master
     environment:
       - SPARK_MODE=master
       - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - RABBITMQ_HOST=rabbitmq
+      - RABBITMQ_PORT=5672
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      - CLICKHOUSE_HOST=clickhouse
+      - CLICKHOUSE_PORT=8123
+      - CLICKHOUSE_DB=traffic_dw
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=traffic_password
     ports:
       - "7077:7077"
       - "8080:8080"
@@ -66,7 +81,7 @@ services:
       - ./spark:/opt/spark-jobs
 
   spark-worker:
-    image: bitnamilegacy/spark:3.4.1
+    image: traffic-spark:3.4.1
     container_name: image_pipeline_spark_worker
     depends_on:
       - spark-master
@@ -76,6 +91,16 @@ services:
       - SPARK_WORKER_CORES=2
       - SPARK_WORKER_MEMORY=2G
       - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - RABBITMQ_HOST=rabbitmq
+      - RABBITMQ_PORT=5672
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      - CLICKHOUSE_HOST=clickhouse
+      - CLICKHOUSE_PORT=8123
+      - CLICKHOUSE_DB=traffic_dw
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=traffic_password
     ports:
       - "8081:8081"
     volumes:
@@ -97,7 +122,7 @@ services:
       timeout: 5s
       retries: 5
 
-  # --- Apache Airflow ---
+  # --- Apache Airflow Initialization ---
   airflow-init:
     image: apache/airflow:2.6.3-python3.9
     container_name: image_pipeline_airflow_init
@@ -119,6 +144,7 @@ services:
           --email admin@example.com \
           --password admin
 
+  # --- Apache Airflow Webserver ---
   airflow-webserver:
     image: apache/airflow:2.6.3-python3.9
     container_name: image_pipeline_airflow_webserver
@@ -141,8 +167,12 @@ services:
       timeout: 5s
       retries: 5
 
+  # --- Apache Airflow Scheduler ---
   airflow-scheduler:
-    image: apache/airflow:2.6.3-python3.9
+    build:
+      context: .
+      dockerfile: airflow/Dockerfile
+    image: traffic-airflow:2.6.3
     container_name: image_pipeline_airflow_scheduler
     depends_on:
       airflow-db:
@@ -151,9 +181,23 @@ services:
       - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@airflow-db/airflow
       - AIRFLOW__CORE__EXECUTOR=LocalExecutor
       - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      - RABBITMQ_HOST=rabbitmq
+      - RABBITMQ_USER=guest
+      - RABBITMQ_PASS=guest
+      - RABBITMQ_QUEUE=image_processing_queue
+      - CLICKHOUSE_HOST=clickhouse
+      - CLICKHOUSE_PORT=8123
+      - CLICKHOUSE_DB=traffic_dw
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=traffic_password
     volumes:
       - ./airflow/dags:/opt/airflow/dags
       - ./spark:/opt/spark-jobs
     command: scheduler
+
 volumes:
   minio_data:

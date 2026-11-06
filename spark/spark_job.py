@@ -5,6 +5,8 @@ import time
 import random
 import logging
 from datetime import datetime
+from queue import Queue, Empty
+from threading import Thread
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -34,63 +36,88 @@ except ImportError:
     logger.error("PySpark is not installed. Please install pyspark to run this script.")
     sys.exit(1)
 
-
-def fetch_queue_messages():
-    """
-    Fetches messages from RabbitMQ queue without acknowledging them yet.
-    Returns: (list of message dicts, list of delivery tags)
-    """
+# The RabbitMQ connection/channel belong exclusively to this thread.
+# Spark may block for a long time on the main thread without starving heartbeats.
+def rabbitmq_consumer(inbox, commands, replies):
     import pika
-    credentials = pika.PlainCredentials(RABBITMQ_USER, RABBITMQ_PASS)
-    params = pika.ConnectionParameters(host=RABBITMQ_HOST, credentials=credentials)
-    
+
+    connection = None
+    delivered = False
     try:
+        credentials = pika.PlainCredentials(RABBITMQ_USER, RABBITMQ_PASS)
+        params = pika.ConnectionParameters(
+            host=RABBITMQ_HOST,
+            credentials=credentials,
+            heartbeat=60,
+            blocked_connection_timeout=300,
+            socket_timeout=15,
+        )
         connection = pika.BlockingConnection(params)
         channel = connection.channel()
         channel.queue_declare(queue=QUEUE_NAME, durable=True)
-        
-        messages = []
-        delivery_tags = []
-        
-        logger.info(f"Fetching messages from RabbitMQ queue '{QUEUE_NAME}'...")
-        while True:
-            method_frame, header_frame, body = channel.basic_get(queue=QUEUE_NAME, auto_ack=False)
-            if method_frame:
-                try:
-                    payload = json.loads(body.decode('utf-8'))
-                    payload['_delivery_tag'] = method_frame.delivery_tag
-                    messages.append(payload)
-                    delivery_tags.append(method_frame.delivery_tag)
-                except Exception as e:
-                    logger.error(f"Error parsing message body: {e}. Rejecting message.")
-                    channel.basic_nack(delivery_tag=method_frame.delivery_tag, requeue=False)
-            else:
+
+        events = []
+        tags = []
+        while len(events) < 50:
+            method, _, body = channel.basic_get(queue=QUEUE_NAME, auto_ack=False)
+            if method is None:
                 break
-                
-        connection.close()
-        logger.info(f"Fetched {len(messages)} messages from RabbitMQ.")
-        return messages, delivery_tags
-    except Exception as e:
-        logger.error(f"Failed to fetch messages from RabbitMQ: {e}")
-        return [], []
+            # Invalid messages remain unacknowledged and are requeued on close.
+            payload = json.loads(body.decode("utf-8"))
+            required = ("event_id", "image_id", "bucket", "s3_key",
+                        "uploaded_at", "filename", "s3_uri",
+                        "file_size_bytes", "mime_type")
+            if not isinstance(payload, dict) or any(k not in payload for k in required):
+                raise ValueError("Invalid RabbitMQ event schema")
+            events.append(payload)
+            tags.append(method.delivery_tag)
+
+        inbox.put((events, None))
+        delivered = True
+        if not events:
+            return
+
+        # All Pika calls occur here, including heartbeat service and ACK.
+        while True:
+            connection.process_data_events(time_limit=1)
+            try:
+                command = commands.get_nowait()
+            except Empty:
+                continue
+            if command == "ACK":
+                if not channel.is_open:
+                    raise RuntimeError("RabbitMQ channel closed before ACK")
+                for tag in tags:
+                    channel.basic_ack(delivery_tag=tag, multiple=False)
+                connection.process_data_events(time_limit=0)
+                replies.put(None)
+                return
+            if command == "ABORT":
+                # Connection close requeues every unacknowledged delivery.
+                replies.put(None)
+                return
+            raise ValueError("Unknown consumer command")
+    except BaseException as exc:
+        logger.exception("RabbitMQ consumer failed")
+        if not delivered:
+            inbox.put((None, exc))
+        else:
+            replies.put(exc)
+    finally:
+        if connection is not None and connection.is_open:
+            try:
+                connection.close()
+            except Exception:
+                logger.exception("Failed to close RabbitMQ connection")
 
 
-def ack_messages(delivery_tags):
-    """
-    Acknowledges the successfully processed messages in RabbitMQ.
-    """
-    import pika
-    credentials = pika.PlainCredentials(RABBITMQ_USER, RABBITMQ_PASS)
-    params = pika.ConnectionParameters(host=RABBITMQ_HOST, credentials=credentials)
+def wait_for_consumer_reply(replies, consumer, timeout=30):
     try:
-        connection = pika.BlockingConnection(params)
-        channel = connection.channel()
-        for tag in delivery_tags:
-            channel.basic_ack(delivery_tag=tag)
-        connection.close()
-        logger.info(f"Acknowledged {len(delivery_tags)} messages in RabbitMQ.")
-    except Exception as e:
-        logger.error(f"Failed to acknowledge messages in RabbitMQ: {e}")
+        error = replies.get(timeout=timeout)
+    except Empty:
+        raise RuntimeError("RabbitMQ consumer did not acknowledge completion")
+    if error is not None:
+        raise RuntimeError("RabbitMQ consumer failed") from error
 
 
 def process_partition(iterator):
@@ -154,9 +181,21 @@ def process_partition(iterator):
 
         try:
             # 1. Fetch image from MinIO
-            response = minio_client.get_object(bucket, s3_key)
-            img_data = response.read()
-            response.close()
+            response = None
+            try:
+                response = minio_client.get_object(bucket, s3_key)
+                img_data = response.read()
+
+                if not img_data:
+                    raise ValueError(
+                        f"Empty image data: bucket={bucket}, key={s3_key}"
+                    )
+            finally:
+                if response is not None:
+                    try:
+                        response.close()
+                    finally:
+                        response.release_conn()
 
             if has_ml and Image is not None:
                 # 2. Run real YOLOv8 object detection
@@ -228,8 +267,9 @@ def process_partition(iterator):
                     vehicle_counts['Motorcycle'] = int(vehicle_counts['Motorcycle'] * 1.3)
                     vehicle_counts['Truck'] = max(0, vehicle_counts['Truck'] - 1)
 
-        except Exception as ex:
-            logger.error(f"Error processing image {image_id}: {ex}")
+        except Exception:
+            logger.exception("Error processing image %s", image_id)
+            raise
 
         inference_time_ms = int((time.time() - start_time) * 1000)
         
@@ -256,131 +296,324 @@ def process_partition(iterator):
                 inference_time_ms
             )
 
-
 def save_to_clickhouse(events, traffic_results):
     """
-    Saves processed results and image metadata to ClickHouse traffic_dw.
+    Save image metadata and traffic results to ClickHouse.
+
+    Avoid inserting existing image IDs and existing
+    (event_id, vehicle_type_id) pairs.
+
+    Intended for a single active pipeline writer.
     """
+    import clickhouse_connect
+
+    client = clickhouse_connect.get_client(
+        host=CLICKHOUSE_HOST,
+        port=CLICKHOUSE_PORT,
+        username=CLICKHOUSE_USER,
+        password=CLICKHOUSE_PASSWORD,
+        database=CLICKHOUSE_DB
+    )
+
     try:
-        # pyrefly: ignore [missing-import]
-        import clickhouse_connect
-        client = clickhouse_connect.get_client(
-            host=CLICKHOUSE_HOST,
-            port=CLICKHOUSE_PORT,
-            username=CLICKHOUSE_USER,
-            password=CLICKHOUSE_PASSWORD,
-            database=CLICKHOUSE_DB
-        )
-    except ImportError:
-        logger.error("clickhouse-connect library missing on driver node.")
-        raise
+        if not events:
+            logger.info("No events to save.")
+            return
 
-    # 1. Prepare dim_images records (using set to de-duplicate)
-    dim_images_data = []
-    seen_images = set()
-    for evt in events:
-        if evt["image_id"] not in seen_images:
+        # 1. Check existing images
+        image_ids = list({
+            event["image_id"] for event in events
+        })
+
+        existing_images_result = client.query(
+            """
+            SELECT DISTINCT image_id
+            FROM dim_images
+            WHERE image_id IN {ids:Array(String)}
+            """,
+            parameters={"ids": image_ids}
+        )
+
+        existing_images = {
+            row[0]
+            for row in existing_images_result.result_rows
+        }
+
+        # 2. Check existing event/vehicle keys
+        event_ids = list({
+            event["event_id"] for event in events
+        })
+
+        existing_facts_result = client.query(
+            """
+            SELECT DISTINCT event_id, vehicle_type_id
+            FROM fact_traffic_flow
+            WHERE event_id IN {ids:Array(String)}
+            """,
+            parameters={"ids": event_ids}
+        )
+
+        existing_keys = {
+            (row[0], int(row[1]))
+            for row in existing_facts_result.result_rows
+        }
+
+        # 3. Prepare new image metadata
+        dim_images_data = []
+        seen_images = set()
+
+        for event in events:
+            image_id = event["image_id"]
+
+            if image_id in existing_images:
+                continue
+
+            if image_id in seen_images:
+                continue
+
             dim_images_data.append((
-                evt["image_id"],
-                evt["filename"],
-                evt["s3_uri"],
-                int(evt["file_size_bytes"]),
-                evt["mime_type"],
-                datetime.fromisoformat(evt["uploaded_at"])
+                image_id,
+                event["filename"],
+                event["s3_uri"],
+                int(event["file_size_bytes"]),
+                event["mime_type"],
+                datetime.fromisoformat(
+                    event["uploaded_at"]
+                )
             ))
-            seen_images.add(evt["image_id"])
 
-    # 2. Prepare fact_traffic_flow records
-    fact_traffic_data = []
-    for res in traffic_results:
-        # res: (event_id, capture_timestamp, camera_id, v_type_id, count, congestion_level, image_id, inference_time_ms)
-        try:
-            timestamp_dt = datetime.fromisoformat(res[1])
-        except ValueError:
-            timestamp_dt = datetime.now()
+            seen_images.add(image_id)
 
-        fact_traffic_data.append((
-            res[0],
-            timestamp_dt,
-            res[2],
-            int(res[3]),
-            int(res[4]),
-            res[5],
-            res[6],
-            int(res[7])
-        ))
+        # 4. Prepare new traffic results
+        fact_traffic_data = []
+        seen_keys = set()
 
-    # Insert into ClickHouse
-    if dim_images_data:
-        client.insert(
-            "dim_images",
-            dim_images_data,
-            column_names=["image_id", "filename", "s3_uri", "file_size_bytes", "mime_type", "uploaded_at"]
+        for result in traffic_results:
+            key = (
+                result[0],
+                int(result[3])
+            )
+
+            if key in existing_keys:
+                continue
+
+            if key in seen_keys:
+                continue
+
+            fact_traffic_data.append((
+                result[0],
+                datetime.fromisoformat(result[1]),
+                result[2],
+                int(result[3]),
+                int(result[4]),
+                result[5],
+                result[6],
+                int(result[7])
+            ))
+
+            seen_keys.add(key)
+
+        # 5. Insert missing images
+        if dim_images_data:
+            client.insert(
+                "dim_images",
+                dim_images_data,
+                column_names=[
+                    "image_id",
+                    "filename",
+                    "s3_uri",
+                    "file_size_bytes",
+                    "mime_type",
+                    "uploaded_at"
+                ]
+            )
+
+        # 6. Insert missing traffic records
+        if fact_traffic_data:
+            client.insert(
+                "fact_traffic_flow",
+                fact_traffic_data,
+                column_names=[
+                    "event_id",
+                    "timestamp",
+                    "camera_id",
+                    "vehicle_type_id",
+                    "count",
+                    "congestion_level",
+                    "image_id",
+                    "inference_time_ms"
+                ]
+            )
+
+        # 7. Verify all event/vehicle keys exist
+        expected_keys = {
+            (event["event_id"], vehicle_type_id)
+            for event in events
+            for vehicle_type_id in range(1, 6)
+        }
+
+        verification_result = client.query(
+            """
+            SELECT event_id, vehicle_type_id
+            FROM fact_traffic_flow
+            WHERE event_id IN {ids:Array(String)}
+            GROUP BY event_id, vehicle_type_id
+            """,
+            parameters={"ids": event_ids}
         )
-        logger.info(f"Successfully inserted {len(dim_images_data)} rows into 'dim_images'.")
 
-    if fact_traffic_data:
-        client.insert(
-            "fact_traffic_flow",
-            fact_traffic_data,
-            column_names=["event_id", "timestamp", "camera_id", "vehicle_type_id", "count", "congestion_level", "image_id", "inference_time_ms"]
+        verified_keys = {
+            (row[0], int(row[1]))
+            for row in verification_result.result_rows
+        }
+
+        missing_keys = expected_keys - verified_keys
+
+        if missing_keys:
+            raise RuntimeError(
+                f"Missing ClickHouse records: {missing_keys}"
+            )
+
+        logger.info(
+            "ClickHouse verified. Inserted %d images "
+            "and %d traffic rows.",
+            len(dim_images_data),
+            len(fact_traffic_data)
         )
-        logger.info(f"Successfully inserted {len(fact_traffic_data)} rows into 'fact_traffic_flow'.")
 
-    client.close()
+    finally:
+        client.close()
 
+def get_completed_event_ids(event_ids):
+    """
+    Return event IDs that already have all five
+    vehicle categories in ClickHouse.
+    """
+    if not event_ids:
+        return set()
+
+    import clickhouse_connect
+
+    client = clickhouse_connect.get_client(
+        host=CLICKHOUSE_HOST,
+        port=CLICKHOUSE_PORT,
+        username=CLICKHOUSE_USER,
+        password=CLICKHOUSE_PASSWORD,
+        database=CLICKHOUSE_DB
+    )
+
+    try:
+        result = client.query(
+            """
+            SELECT event_id
+            FROM fact_traffic_flow
+            WHERE event_id IN {ids:Array(String)}
+            GROUP BY event_id
+            HAVING uniqExact(vehicle_type_id) = 5
+            """,
+            parameters={
+                "ids": list(set(event_ids))
+            }
+        )
+
+        return {
+            row[0]
+            for row in result.result_rows
+        }
+
+    finally:
+        client.close()
 
 def main():
-    # 1. Fetch events from RabbitMQ
-    events, delivery_tags = fetch_queue_messages()
-    if not events:
-        logger.info("No events found in queue. Exiting Spark job.")
-        return
-
-    # 2. Start Spark Session
-    logger.info("Initializing Spark Session...")
-    spark = SparkSession.builder \
-        .appName("Distributed-Traffic-YOLO-Detection") \
-        .master("local[*]") \
-        .config("spark.driver.memory", "4g") \
-        .getOrCreate()
-
-    # 3. Create parallel input list
-    # Structure: (event_id, image_id, bucket, s3_key, uploaded_at, filename, camera_id, capture_timestamp)
-    spark_input_data = [
-        (
-            e["event_id"],
-            e["image_id"],
-            e["bucket"],
-            e["s3_key"],
-            e["uploaded_at"],
-            e["filename"],
-            e.get("camera_id", "CAM-UNKNOWN"),
-            e.get("capture_timestamp", e["uploaded_at"])
-        )
-        for e in events
-    ]
-
-    rdd = spark.sparkContext.parallelize(spark_input_data)
-    
-    # 4. Process partitions on workers (run YOLO / mock detection)
-    logger.info("Running traffic vehicle detection distributed Spark job...")
-    results_rdd = rdd.mapPartitions(process_partition)
-    
-    # 5. Collect results back to driver
-    traffic_results = results_rdd.collect()
-    logger.info(f"Spark job completed. Collected {len(traffic_results)} traffic flow records.")
-    
-    # 6. Save results to ClickHouse
+    inbox = Queue(maxsize=1)
+    commands = Queue(maxsize=1)
+    replies = Queue(maxsize=1)
+    consumer = Thread(
+        target=rabbitmq_consumer,
+        args=(inbox, commands, replies),
+        name="rabbitmq-consumer",
+        daemon=True,
+    )
+    consumer.start()
+    spark = None
+    command_sent = False
     try:
-        save_to_clickhouse(events, traffic_results)
-        # 7. Acknowledge messages in RabbitMQ only after successful database write
-        ack_messages(delivery_tags)
-        logger.info("Pipeline run succeeded. All messages acknowledged.")
-    except Exception as e:
-        logger.error(f"Failed to save results to ClickHouse: {e}. Messages will not be acknowledged.")
-    
-    spark.stop()
+        try:
+            events, error = inbox.get(timeout=45)
+        except Empty:
+            raise RuntimeError("Timed out fetching RabbitMQ events")
+        if error is not None:
+            raise RuntimeError("Unable to fetch RabbitMQ events") from error
+        if not events:
+            logger.info("RabbitMQ queue is empty")
+            return
+
+        unique_events = {}
+        for event in events:
+            eid = event["event_id"]
+            if eid in unique_events and unique_events[eid] != event:
+                raise ValueError("Conflicting messages for event_id: %s" % eid)
+            unique_events[eid] = event
+        event_ids = list(unique_events)
+        completed = get_completed_event_ids(event_ids)
+        pending = [e for eid, e in unique_events.items() if eid not in completed]
+        logger.info("Messages=%d, completed=%d, pending=%d",
+                    len(events), len(completed), len(pending))
+
+        if pending:
+            spark = (
+                SparkSession.builder
+                .appName("Distributed-Traffic-YOLO-Detection")
+                .master(
+                    os.getenv(
+                        "SPARK_MASTER_URL",
+                        "spark://spark-master:7077"
+                    )
+                )
+                .getOrCreate()
+            )
+            spark_input_data = [
+                (e["event_id"], e["image_id"], e["bucket"], e["s3_key"],
+                 e["uploaded_at"], e["filename"],
+                 e.get("camera_id", "CAM-UNKNOWN"),
+                 e.get("capture_timestamp", e["uploaded_at"]))
+                for e in pending
+            ]
+            traffic_results = (
+                spark.sparkContext.parallelize(spark_input_data)
+                .mapPartitions(process_partition)
+                .collect()
+            )
+            expected = {(e["event_id"], kind) for e in pending for kind in range(1, 6)}
+            actual = [(r[0], int(r[3])) for r in traffic_results]
+            if len(actual) != len(expected) or set(actual) != expected:
+                raise RuntimeError("Incomplete or duplicate Spark output; refusing INSERT")
+            save_to_clickhouse(pending, traffic_results)
+
+        verified = get_completed_event_ids(event_ids)
+        if set(event_ids) - verified:
+            raise RuntimeError("ClickHouse verification failed; refusing ACK")
+
+        commands.put("ACK")
+        command_sent = True
+        wait_for_consumer_reply(replies, consumer)
+        logger.info("Verified events; requested ACK on original RabbitMQ channel")
+    except BaseException:
+        logger.exception("Pipeline failed; unacknowledged RabbitMQ messages will be requeued")
+        if not command_sent and consumer.is_alive():
+            commands.put("ABORT")
+            command_sent = True
+            try:
+                wait_for_consumer_reply(replies, consumer)
+            except Exception:
+                logger.exception("RabbitMQ cleanup failed")
+        raise
+    finally:
+        if spark is not None:
+            spark.stop()
+        consumer.join(timeout=15)
+        if consumer.is_alive():
+            logger.error("RabbitMQ consumer thread still running after shutdown")
 
 
 if __name__ == "__main__":

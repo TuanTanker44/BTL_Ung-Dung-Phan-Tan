@@ -33,6 +33,7 @@ CLICKHOUSE_PASSWORD = os.getenv("CLICKHOUSE_PASSWORD", "traffic_password")
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "localhost:9000")
 MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin")
+VEHICLE_TYPE_NAMES = ["Car", "Motorcycle", "Bus", "Truck"]
 
 # Custom premium styling overrides (Neon Theme)
 st.markdown("""
@@ -138,16 +139,8 @@ def fetch_dashboard_data():
     try:
         client = get_ch_client()
         
-        # 1. KPI Aggregations
-        kpis = client.query("""
-            SELECT 
-                (SELECT count(distinct image_id) FROM dim_images) as total_images,
-                (SELECT sum(count) FROM fact_traffic_flow) as total_vehicles,
-                (SELECT round(avg(inference_time_ms), 1) FROM fact_traffic_flow) as avg_inference
-        """).result_rows[0]
-        
         # 2. Cameras
-        cameras_df = client.query_df("SELECT camera_id, location, latitude, longitude FROM dim_cameras")
+        cameras_df = client.query_df("SELECT camera_id, location, latitude, longitude FROM dim_cameras FINAL")
         cameras_df["latitude"] = cameras_df["latitude"].astype(float)
         cameras_df["longitude"] = cameras_df["longitude"].astype(float)
         
@@ -160,8 +153,8 @@ def fetch_dashboard_data():
                 sum(f.count) as total_count, 
                 avg(f.count) as avg_count
             FROM fact_traffic_flow f
-            JOIN dim_cameras c ON f.camera_id = c.camera_id
-            JOIN dim_vehicles v ON f.vehicle_type_id = v.vehicle_type_id
+            JOIN (SELECT * FROM dim_cameras FINAL) AS c ON f.camera_id = c.camera_id
+            JOIN (SELECT * FROM dim_vehicles FINAL) AS v ON f.vehicle_type_id = v.vehicle_type_id
             GROUP BY f.camera_id, c.location, v.vehicle_type_name
         """)
         
@@ -179,45 +172,46 @@ def fetch_dashboard_data():
                 f.timestamp AS timestamp, 
                 f.camera_id AS camera_id, 
                 c.location AS location,
-                sum(f.count) as total_vehicles,
+                sumIf(f.count, f.vehicle_type_id IN (1, 2, 3, 4)) as total_vehicles,
                 avg(f.inference_time_ms) as avg_inference
             FROM fact_traffic_flow f
-            JOIN dim_cameras c ON f.camera_id = c.camera_id
+            JOIN (SELECT * FROM dim_cameras FINAL) AS c ON f.camera_id = c.camera_id
             GROUP BY f.timestamp, f.camera_id, c.location
             ORDER BY f.timestamp ASC
         """)
         
         # 6. Latest Images list (for details pane)
+        # captured_at = giờ chụp thật (cùng múi giờ với biểu đồ), thay cho uploaded_at (UTC)
         images_df = client.query_df("""
             SELECT 
                 img.image_id AS image_id, 
                 img.filename AS filename, 
                 img.s3_uri AS s3_uri, 
                 img.file_size_bytes AS file_size_bytes, 
-                img.uploaded_at AS uploaded_at,
+                min(f.timestamp) AS captured_at,
                 f.camera_id AS camera_id, 
                 c.location AS location, 
                 f.congestion_level AS congestion_level,
-                sum(f.count) as total_vehicles
-            FROM dim_images img
+                sumIf(f.count, f.vehicle_type_id IN (1, 2, 3, 4)) as total_vehicles
+            FROM (SELECT * FROM dim_images FINAL) AS img
             JOIN fact_traffic_flow f ON img.image_id = f.image_id
-            JOIN dim_cameras c ON f.camera_id = c.camera_id
-            GROUP BY img.image_id, img.filename, img.s3_uri, img.file_size_bytes, img.uploaded_at, f.camera_id, c.location, f.congestion_level
-            ORDER BY img.uploaded_at DESC
+            JOIN (SELECT * FROM dim_cameras FINAL) AS c ON f.camera_id = c.camera_id
+            GROUP BY img.image_id, img.filename, img.s3_uri, img.file_size_bytes, f.camera_id, c.location, f.congestion_level
+            ORDER BY captured_at DESC
         """)
         
         client.close()
-        return kpis, cameras_df, traffic_summary, congestion_levels, time_series, images_df
+        return cameras_df, traffic_summary, congestion_levels, time_series, images_df
     except Exception as e:
         st.error(f"Failed to load data from ClickHouse: {e}")
-        return None, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
 # Main Layout
 st.markdown('<div class="main-header">🚦 Trung Tâm Giám Sát Giao Thông Thông Minh</div>', unsafe_allow_html=True)
 st.markdown('<div class="subheader">Hệ thống phân tích lưu lượng xe thời gian thực tích hợp AI (PySpark & ClickHouse Star Schema)</div>', unsafe_allow_html=True)
 
 # Fetch Data
-kpis, cameras_df, traffic_summary, congestion_levels, time_series, images_df = fetch_dashboard_data()
+cameras_df, traffic_summary, congestion_levels, time_series, images_df = fetch_dashboard_data()
 
 if cameras_df.empty or traffic_summary.empty:
     st.warning("⚠️ Cơ sở dữ liệu ClickHouse chưa có dữ liệu giao thông hoặc bảng trống!")
@@ -225,39 +219,6 @@ if cameras_df.empty or traffic_summary.empty:
     if st.button("🔄 Tải lại dữ liệu"):
         st.rerun()
 else:
-    # --- Top KPI Metrics ---
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.markdown(f"""
-            <div class="metric-container">
-                <div class="metric-lbl">Tổng Số Camera Hoạt Động</div>
-                <div class="metric-val">{len(cameras_df)}</div>
-            </div>
-        """, unsafe_allow_html=True)
-    with col2:
-        st.markdown(f"""
-            <div class="metric-container">
-                <div class="metric-lbl">Tổng Khung Hình Đã Xử Lý</div>
-                <div class="metric-val">{kpis[0] if kpis else 0}</div>
-            </div>
-        """, unsafe_allow_html=True)
-    with col3:
-        st.markdown(f"""
-            <div class="metric-container">
-                <div class="metric-lbl">Tổng Số Xe Đã Nhận Diện</div>
-                <div class="metric-val">{kpis[1] if kpis else 0}</div>
-            </div>
-        """, unsafe_allow_html=True)
-    with col4:
-        st.markdown(f"""
-            <div class="metric-container">
-                <div class="metric-lbl">Thời Gian Chạy AI Trình Trung Bình</div>
-                <div class="metric-val">{kpis[2] if kpis else 0} ms</div>
-            </div>
-        """, unsafe_allow_html=True)
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
     # --- Sidebar Filters ---
     st.sidebar.markdown("### ⚙️ Cấu Hiện Tại")
     st.sidebar.markdown(f"**Kho Dữ Liệu:** `ClickHouse` ({CLICKHOUSE_HOST}:{CLICKHOUSE_PORT})")
@@ -278,6 +239,46 @@ else:
         filtered_summary = traffic_summary
         filtered_congestion = congestion_levels
         filtered_images = images_df
+
+    # --- KPI tính theo bộ lọc camera đang chọn ---
+    vehicle_rows = filtered_summary[filtered_summary["vehicle_type_name"].isin(VEHICLE_TYPE_NAMES)]
+    kpi_cameras = filtered_summary["camera_id"].nunique()
+    kpi_frames = filtered_images["image_id"].nunique()
+    kpi_vehicles = int(vehicle_rows["total_count"].sum())
+    kpi_infer = round(float(filtered_ts["avg_inference"].mean()), 1) if not filtered_ts.empty else 0
+
+    # --- Top KPI Metrics ---
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.markdown(f"""
+            <div class="metric-container">
+                <div class="metric-lbl">Camera Có Dữ Liệu</div>
+                <div class="metric-val">{kpi_cameras}</div>
+            </div>
+        """, unsafe_allow_html=True)
+    with col2:
+        st.markdown(f"""
+            <div class="metric-container">
+                <div class="metric-lbl">Tổng Khung Hình Đã Xử Lý</div>
+                <div class="metric-val">{kpi_frames}</div>
+            </div>
+        """, unsafe_allow_html=True)
+    with col3:
+        st.markdown(f"""
+            <div class="metric-container">
+                <div class="metric-lbl">Tổng Số Xe (Không Gồm Người Đi Bộ)</div>
+                <div class="metric-val">{kpi_vehicles}</div>
+            </div>
+        """, unsafe_allow_html=True)
+    with col4:
+        st.markdown(f"""
+            <div class="metric-container">
+                <div class="metric-lbl">Thời Gian Chạy AI Trung Bình</div>
+                <div class="metric-val">{kpi_infer} ms</div>
+            </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
 
     # --- Tabbed Main Content ---
     tab_dashboard, tab_map, tab_images = st.tabs(["📊 Thống Kê & Đồ Thị", "🗺️ Bản Đồ Giao Thông", "🖼️ Xem Ảnh Chi Tiết (MinIO API)"])
@@ -428,8 +429,8 @@ else:
             image_options = []
             for _, r in filtered_images.iterrows():
                 # Formatter: Camera_ID - Location - Time (Vehicles: X, Congestion: Y)
-                label = f"{r['camera_id']} | {r['location']} | {r['uploaded_at'].strftime('%Y-%m-%d %H:%M:%S')} (Xe đếm được: {r['total_vehicles']}, Ùn tắc: {r['congestion_level']})"
-                image_options.append((label, r['s3_uri'], r['image_id'], r['camera_id'], r['location'], r['uploaded_at'], r['congestion_level']))
+                label = f"{r['camera_id']} | {r['location']} | {r['captured_at'].strftime('%Y-%m-%d %H:%M:%S')} (Xe đếm được: {r['total_vehicles']}, Ùn tắc: {r['congestion_level']})"
+                image_options.append((label, r['s3_uri'], r['image_id'], r['camera_id'], r['location'], r['captured_at'], r['congestion_level']))
                 
             selected_option = st.selectbox(
                 "Chọn khung hình muốn kiểm tra:",
@@ -438,7 +439,7 @@ else:
             )
             
             if selected_option:
-                _, s3_uri, image_id, cam_id, loc, uploaded_at, cong = selected_option
+                _, s3_uri, image_id, cam_id, loc, captured_at, cong = selected_option
                 
                 # Retrieve from MinIO
                 with st.spinner("🔄 Đang tải hình ảnh từ kho lưu trữ MinIO S3..."):
@@ -448,14 +449,14 @@ else:
                 
                 with img_col:
                     if img_file:
-                        st.image(img_file, caption=f"Ảnh chụp camera thực tế từ {cam_id} ({loc}) vào {uploaded_at}", use_container_width=True)
+                        st.image(img_file, caption=f"Ảnh chụp camera thực tế từ {cam_id} ({loc}) vào {captured_at}", use_container_width=True)
                     else:
                         st.error("❌ Không thể lấy ảnh từ MinIO S3. Vui lòng kiểm tra kết nối tới container MinIO (localhost:9000).")
                         
                 with details_col:
                     st.markdown(f'<div class="camera-badge">{cam_id}</div>', unsafe_allow_html=True)
                     st.markdown(f"**Vị trí:** `{loc}`")
-                    st.markdown(f"**Thời gian tải lên:** `{uploaded_at.strftime('%Y-%m-%d %H:%M:%S')}`")
+                    st.markdown(f"**Thời gian chụp:** `{captured_at.strftime('%Y-%m-%d %H:%M:%S')}`")
                     
                     # Congestion color box
                     cong_colors = {"High": "red", "Medium": "orange", "Low": "green"}
@@ -470,13 +471,13 @@ else:
                     # Fetch specific counts for this image
                     try:
                         client = get_ch_client()
-                        counts_df = client.query_df(f"""
+                        counts_df = client.query_df("""
                             SELECT v.vehicle_type_name as `Loại Xe`, f.count as `Số Lượng`
                             FROM fact_traffic_flow f
-                            JOIN dim_vehicles v ON f.vehicle_type_id = v.vehicle_type_id
-                            WHERE f.image_id = '{image_id}'
+                            JOIN (SELECT * FROM dim_vehicles FINAL) AS v ON f.vehicle_type_id = v.vehicle_type_id
+                            WHERE f.image_id = {image_id:String}
                             ORDER BY `Số Lượng` DESC
-                        """)
+                        """, parameters={"image_id": image_id})
                         client.close()
                         
                         st.table(counts_df)
