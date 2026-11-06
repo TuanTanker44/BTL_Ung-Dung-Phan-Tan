@@ -41,3 +41,4 @@ Thumbs.db
 
 # Database backups
 backups/
+*.log
