@@ -333,7 +333,7 @@ def process_partition(iterator, detection_mode):
 
 
 
-def save_to_clickhouse(events, traffic_results):
+def save_to_clickhouse(events, traffic_results, detection_mode):
     """
     Save image metadata and traffic results to ClickHouse.
 
@@ -450,8 +450,9 @@ def save_to_clickhouse(events, traffic_results):
                 int(result[4]),
                 result[5],
                 result[6],
-                int(result[7])
-            ))
+                int(result[7]),
+                detection_mode
+))
 
             seen_keys.add(key)
 
