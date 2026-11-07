@@ -177,3 +177,10 @@ Mặc dù dự án đã triển khai hoàn chỉnh kiến trúc End-to-End từ 
 ### 4. 🔒 Bảo mật & Quyền riêng tư (Data Privacy & PII)
 * **Làm mờ thông tin cá nhân (PII Masking)**: Ảnh camera thực tế chứa biển số xe và khuôn mặt. Cần tích hợp module AI tự động làm mờ (blurring) các thông tin nhạy cảm trước khi lưu trữ lâu dài trên Data Lake (MinIO S3) để tuân thủ các quy định bảo vệ dữ liệu cá nhân.
 
+## Khắc phục lỗi Dashboard thiếu thư viện
+
+Nếu Dashboard báo lỗi ModuleNotFoundError: No module named 'clickhouse_connect',
+hãy kích hoạt môi trường Python và cài đặt các thư viện:
+
+```powershell
+python -m pip install -r requirements.txt
