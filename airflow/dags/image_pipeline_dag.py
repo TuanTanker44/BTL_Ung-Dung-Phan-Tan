@@ -23,7 +23,7 @@ with DAG(
         "using Spark Cluster and YOLOv8/Mock, "
         "with results stored in ClickHouse"
     ),
-    schedule_interval=None,
+    schedule_interval="* * * * *",
     start_date=datetime(2026, 1, 1),
     catchup=False,
     max_active_runs=1,
