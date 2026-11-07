@@ -172,37 +172,49 @@ def fetch_dashboard_data(detection_mode):
         
         # 5. Time series traffic flow
         time_series = client.query_df("""
-            SELECT 
-                f.timestamp AS timestamp, 
-                f.camera_id AS camera_id, 
+            SELECT
+                f.timestamp AS timestamp,
+                f.camera_id AS camera_id,
                 c.location AS location,
-                sumIf(f.count, f.vehicle_type_id IN (1, 2, 3, 4)) as total_vehicles,
-                avg(f.inference_time_ms) as avg_inference
+                sumIf(f.count, f.vehicle_type_id IN (1, 2, 3, 4)) AS total_vehicles,
+                avg(f.inference_time_ms) AS avg_inference
             FROM fact_traffic_flow f
-            JOIN (SELECT * FROM dim_cameras FINAL) AS c ON f.camera_id = c.camera_id
+            JOIN (SELECT * FROM dim_cameras FINAL) AS c
+                ON f.camera_id = c.camera_id
+            WHERE f.detection_mode = {mode:String}
             GROUP BY f.timestamp, f.camera_id, c.location
             ORDER BY f.timestamp ASC
-        """)
+        """, parameters={"mode": detection_mode})
         
         # 6. Latest Images list (for details pane)
         # captured_at = giờ chụp thật (cùng múi giờ với biểu đồ), thay cho uploaded_at (UTC)
         images_df = client.query_df("""
-            SELECT 
-                img.image_id AS image_id, 
-                img.filename AS filename, 
-                img.s3_uri AS s3_uri, 
-                img.file_size_bytes AS file_size_bytes, 
+            SELECT
+                img.image_id AS image_id,
+                img.filename AS filename,
+                img.s3_uri AS s3_uri,
+                img.file_size_bytes AS file_size_bytes,
                 min(f.timestamp) AS captured_at,
-                f.camera_id AS camera_id, 
-                c.location AS location, 
+                f.camera_id AS camera_id,
+                c.location AS location,
                 f.congestion_level AS congestion_level,
-                sumIf(f.count, f.vehicle_type_id IN (1, 2, 3, 4)) as total_vehicles
+                sumIf(f.count, f.vehicle_type_id IN (1, 2, 3, 4)) AS total_vehicles
             FROM (SELECT * FROM dim_images FINAL) AS img
-            JOIN fact_traffic_flow f ON img.image_id = f.image_id
-            JOIN (SELECT * FROM dim_cameras FINAL) AS c ON f.camera_id = c.camera_id
-            GROUP BY img.image_id, img.filename, img.s3_uri, img.file_size_bytes, f.camera_id, c.location, f.congestion_level
+            JOIN fact_traffic_flow f
+                ON img.image_id = f.image_id
+            JOIN (SELECT * FROM dim_cameras FINAL) AS c
+                ON f.camera_id = c.camera_id
+            WHERE f.detection_mode = {mode:String}
+            GROUP BY
+                img.image_id,
+                img.filename,
+                img.s3_uri,
+                img.file_size_bytes,
+                f.camera_id,
+                c.location,
+                f.congestion_level
             ORDER BY captured_at DESC
-        """)
+        """, parameters={"mode": detection_mode})
         
         client.close()
         return cameras_df, traffic_summary, congestion_levels, time_series, images_df
@@ -493,8 +505,12 @@ else:
                             FROM fact_traffic_flow f
                             JOIN (SELECT * FROM dim_vehicles FINAL) AS v ON f.vehicle_type_id = v.vehicle_type_id
                             WHERE f.image_id = {image_id:String}
+                              AND f.detection_mode = {mode:String}
                             ORDER BY `Số Lượng` DESC
-                        """, parameters={"image_id": image_id})
+                        """, parameters={
+                                "image_id": image_id,
+                                "mode": detection_mode
+                                })
                         client.close()
                         
                         st.table(counts_df)
