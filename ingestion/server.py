@@ -123,6 +123,7 @@ class ImageIngestionService(image_ingestion_pb2_grpc.ImageIngestionServiceServic
                         properties=pika.BasicProperties(
                             delivery_mode=2,  # tin nhắn bền vững
                             content_type="application/json",
+                            message_id=payload["event_id"],
                         ),
                         mandatory=True,
                     )

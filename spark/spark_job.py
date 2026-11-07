@@ -23,6 +23,7 @@ RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "localhost")
 RABBITMQ_USER = os.getenv("RABBITMQ_USER", "guest")
 RABBITMQ_PASS = os.getenv("RABBITMQ_PASS", "guest")
 QUEUE_NAME = os.getenv("RABBITMQ_QUEUE", "image_processing_queue")
+DLQ_NAME = f"{QUEUE_NAME}.dlq"
 
 CLICKHOUSE_HOST = os.getenv("CLICKHOUSE_HOST", "localhost")
 CLICKHOUSE_PORT = int(os.getenv("CLICKHOUSE_PORT", "8123"))
@@ -57,11 +58,13 @@ def rabbitmq_consumer(inbox, commands, replies):
         connection = pika.BlockingConnection(params)
         channel = connection.channel()
         channel.queue_declare(queue=QUEUE_NAME, durable=True)
+        channel.queue_declare(queue=DLQ_NAME, durable=True)
+        channel.confirm_delivery()
 
         events = []
-        tags = []
+        deliveries = []
         while len(events) < 50:
-            method, _, body = channel.basic_get(queue=QUEUE_NAME, auto_ack=False)
+            method, properties, body = channel.basic_get(queue=QUEUE_NAME, auto_ack=False)
             if method is None:
                 break
             # Invalid messages remain unacknowledged and are requeued on close.
@@ -72,7 +75,7 @@ def rabbitmq_consumer(inbox, commands, replies):
             if not isinstance(payload, dict) or any(k not in payload for k in required):
                 raise ValueError("Invalid RabbitMQ event schema")
             events.append(payload)
-            tags.append(method.delivery_tag)
+            deliveries.append((method.delivery_tag, payload["event_id"], body, properties))
 
         inbox.put((events, None))
         delivered = True
@@ -86,11 +89,37 @@ def rabbitmq_consumer(inbox, commands, replies):
                 command = commands.get_nowait()
             except Empty:
                 continue
-            if command == "ACK":
-                if not channel.is_open:
-                    raise RuntimeError("RabbitMQ channel closed before ACK")
-                for tag in tags:
+            if isinstance(command, tuple) and command[0] == "COMPLETE":
+                _, failures = command
+
+                for tag, event_id, body, properties in deliveries:
+                    if event_id in failures:
+                        headers = dict(properties.headers or {})
+                        attempt = int(headers.get("x-processing-attempt", 0)) + 1
+
+                        headers["x-processing-attempt"] = attempt
+                        headers["x-last-error"] = failures[event_id]
+
+                        target_queue = DLQ_NAME if attempt >= 3 else QUEUE_NAME
+                        channel.basic_publish(
+                            exchange="",
+                            routing_key=target_queue,
+                            body=body,
+                            properties=pika.BasicProperties(
+                                content_type=properties.content_type,
+                                delivery_mode=2,
+                                message_id=event_id,
+                                headers=headers,
+                            ),
+                            mandatory=True,
+                        )
+                        logger.warning(
+                            "Event %s failed on attempt %d; sent to %s",
+                            event_id, attempt, target_queue,
+                        )
+
                     channel.basic_ack(delivery_tag=tag, multiple=False)
+
                 connection.process_data_events(time_limit=0)
                 replies.put(None)
                 return
@@ -128,6 +157,7 @@ def process_partition(iterator, detection_mode):
     runs YOLOv8 object detection (or mock detection), and yields metrics.
     """
     import io
+    from minio.error import S3Error
     
     # Initialize MinIO client inside worker partition
     try:
@@ -262,6 +292,14 @@ def process_partition(iterator, detection_mode):
                     vehicle_counts['Motorcycle'] = int(vehicle_counts['Motorcycle'] * 1.3)
                     vehicle_counts['Truck'] = max(0, vehicle_counts['Truck'] - 1)
 
+        except S3Error as exc:
+            if exc.code != "NoSuchKey":
+                raise
+
+            reason = f"MinIO {exc.code}: {bucket}/{s3_key}"
+            logger.warning("Image missing for event %s: %s", event_id, reason)
+            yield event_id, [], reason
+            continue
         except Exception:
             logger.exception("Error processing image %s", image_id)
             raise
@@ -277,10 +315,10 @@ def process_partition(iterator, detection_mode):
         else:
             congestion_level = "Low"
 
-        # Yield a database record for each vehicle type
+        rows = []
         for v_type, count in vehicle_counts.items():
             v_type_id = vehicle_type_mapping.get(v_type, 0)
-            yield (
+            rows.append((
                 event_id,
                 capture_timestamp,
                 camera_id,
@@ -288,8 +326,12 @@ def process_partition(iterator, detection_mode):
                 count,
                 congestion_level,
                 image_id,
-                inference_time_ms
-            )
+                inference_time_ms,
+            ))
+
+        yield event_id, rows, None
+
+
 
 def save_to_clickhouse(events, traffic_results):
     """
@@ -565,6 +607,7 @@ def main():
         logger.info("Messages=%d, completed=%d, pending=%d",
                     len(events), len(completed), len(pending))
 
+        failures = {}
         if pending:
             spark = (
                 SparkSession.builder
@@ -584,24 +627,47 @@ def main():
                  e.get("capture_timestamp", e["uploaded_at"]))
                 for e in pending
             ]
-            traffic_results = (
+            outcomes = (
                 spark.sparkContext.parallelize(spark_input_data)
                 .mapPartitions(
                     partial(process_partition, detection_mode=detection_mode)
                 )
                 .collect()
             )
-            expected = {(e["event_id"], kind) for e in pending for kind in range(1, 6)}
-            actual = [(r[0], int(r[3])) for r in traffic_results]
+
+            pending_ids = {event["event_id"] for event in pending}
+            returned_ids = {event_id for event_id, _, _ in outcomes}
+            if len(outcomes) != len(pending) or returned_ids != pending_ids:
+                raise RuntimeError("Missing or duplicate Spark event results")
+
+            traffic_results = []
+            for event_id, rows, reason in outcomes:
+                if reason is None:
+                    traffic_results.extend(rows)
+                else:
+                    failures[event_id] = reason
+
+            successful = [
+                event for event in pending if event["event_id"] not in failures
+            ]
+            expected = {
+                (event["event_id"], kind)
+                for event in successful
+                for kind in range(1, 6)
+            }
+            actual = [(row[0], int(row[3])) for row in traffic_results]
             if len(actual) != len(expected) or set(actual) != expected:
                 raise RuntimeError("Incomplete or duplicate Spark output; refusing INSERT")
-            save_to_clickhouse(pending, traffic_results)
 
-        verified = get_completed_event_ids(event_ids)
-        if set(event_ids) - verified:
+            if successful:
+                save_to_clickhouse(successful, traffic_results, detection_mode)
+
+        successful_ids = set(event_ids) - set(failures)
+        verified = get_completed_event_ids(successful_ids)
+        if successful_ids - verified:
             raise RuntimeError("ClickHouse verification failed; refusing ACK")
 
-        commands.put("ACK")
+        commands.put(("COMPLETE", failures))
         command_sent = True
         wait_for_consumer_reply(replies, consumer)
         logger.info("Verified events; requested ACK on original RabbitMQ channel")
