@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS fact_traffic_flow (
     count UInt16,
     congestion_level String, -- Low, Medium, High
     image_id String,
-    inference_time_ms UInt32
+    inference_time_ms UInt32,
+    detection_mode LowCardinality(String) DEFAULT 'unknown'
 ) ENGINE = MergeTree()
 ORDER BY (camera_id, timestamp, vehicle_type_id);
 

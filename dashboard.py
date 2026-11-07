@@ -135,7 +135,7 @@ def load_minio_image(s3_uri):
 
 # Load Data from ClickHouse
 @st.cache_data(ttl=10) # Refresh data cache every 10 seconds
-def fetch_dashboard_data():
+def fetch_dashboard_data(detection_mode):
     try:
         client = get_ch_client()
         
@@ -146,25 +146,29 @@ def fetch_dashboard_data():
         
         # 3. Traffic Summary Grouped
         traffic_summary = client.query_df("""
-            SELECT 
-                f.camera_id AS camera_id, 
-                c.location AS location, 
-                v.vehicle_type_name AS vehicle_type_name, 
-                sum(f.count) as total_count, 
-                avg(f.count) as avg_count
+            SELECT
+                f.camera_id AS camera_id,
+                c.location AS location,
+                v.vehicle_type_name AS vehicle_type_name,
+                sum(f.count) AS total_count,
+                avg(f.count) AS avg_count
             FROM fact_traffic_flow f
             JOIN (SELECT * FROM dim_cameras FINAL) AS c ON f.camera_id = c.camera_id
             JOIN (SELECT * FROM dim_vehicles FINAL) AS v ON f.vehicle_type_id = v.vehicle_type_id
+            WHERE f.detection_mode = {mode:String}
             GROUP BY f.camera_id, c.location, v.vehicle_type_name
-        """)
-        
+        """, parameters={"mode": detection_mode})
+
         # 4. Congestion Levels
         congestion_levels = client.query_df("""
-            SELECT 
-                camera_id, congestion_level, count(distinct event_id) as frame_count
+            SELECT
+                camera_id,
+                congestion_level,
+                count(distinct event_id) AS frame_count
             FROM fact_traffic_flow
+            WHERE detection_mode = {mode:String}
             GROUP BY camera_id, congestion_level
-        """)
+        """, parameters={"mode": detection_mode})
         
         # 5. Time series traffic flow
         time_series = client.query_df("""
@@ -211,7 +215,20 @@ st.markdown('<div class="main-header">🚦 Trung Tâm Giám Sát Giao Thông Th�
 st.markdown('<div class="subheader">Hệ thống phân tích lưu lượng xe thời gian thực tích hợp AI (PySpark & ClickHouse Star Schema)</div>', unsafe_allow_html=True)
 
 # Fetch Data
-cameras_df, traffic_summary, congestion_levels, time_series, images_df = fetch_dashboard_data()
+mode_labels = {
+    "yolo": "YOLOv8 — nhận diện thật",
+    "mock": "Mock — dữ liệu mô phỏng",
+    "unknown": "Dữ liệu cũ — chưa rõ chế độ",
+}
+
+detection_mode = st.sidebar.selectbox(
+    "Nguồn kết quả nhận diện",
+    list(mode_labels),
+    format_func=mode_labels.get,
+)
+
+st.caption(f"Đang hiển thị: {mode_labels[detection_mode]}")
+cameras_df, traffic_summary, congestion_levels, time_series, images_df = fetch_dashboard_data(detection_mode)
 
 if cameras_df.empty or traffic_summary.empty:
     st.warning("⚠️ Cơ sở dữ liệu ClickHouse chưa có dữ liệu giao thông hoặc bảng trống!")

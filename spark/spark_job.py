@@ -7,6 +7,8 @@ import logging
 from datetime import datetime
 from queue import Queue, Empty
 from threading import Thread
+from functools import partial
+from pathlib import Path
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -120,7 +122,7 @@ def wait_for_consumer_reply(replies, consumer, timeout=30):
         raise RuntimeError("RabbitMQ consumer failed") from error
 
 
-def process_partition(iterator):
+def process_partition(iterator, detection_mode):
     """
     Processes a partition of events: downloads images from MinIO,
     runs YOLOv8 object detection (or mock detection), and yields metrics.
@@ -141,22 +143,15 @@ def process_partition(iterator):
         logger.error("minio library missing on worker node.")
         raise
 
-    has_ml = False
-    model = None
-    Image = None
+    if detection_mode == "yolo":
+        model_path = Path("/opt/spark-jobs/weights/yolov8n.pt")
+        if not model_path.is_file():
+            raise FileNotFoundError(f"Thiếu model YOLOv8: {model_path}")
 
-    try:
-        # pyrefly: ignore [missing-import]
         from PIL import Image
-        # pyrefly: ignore [missing-import]
         from ultralytics import YOLO
-        # Load pre-trained YOLOv8 nano model
-        model = YOLO('yolov8n.pt')
-        has_ml = True
-        logger.info("YOLOv8 Model loaded successfully on Spark worker partition.")
-    except Exception as e:
-        logger.warning(f"Could not load YOLOv8 (missing ultralytics/PyTorch): {e}. "
-                       "Falling back to high-fidelity mock object detection.")
+
+        model = YOLO(str(model_path))
 
     vehicle_type_mapping = {
         'Car': 1,
@@ -197,7 +192,7 @@ def process_partition(iterator):
                     finally:
                         response.release_conn()
 
-            if has_ml and Image is not None:
+            if detection_mode == "yolo":
                 # 2. Run real YOLOv8 object detection
                 img_io = io.BytesIO(img_data)
                 img = Image.open(img_io)
@@ -346,18 +341,23 @@ def save_to_clickhouse(events, traffic_results):
 
         existing_facts_result = client.query(
             """
-            SELECT DISTINCT event_id, vehicle_type_id
+            SELECT DISTINCT event_id, vehicle_type_id, detection_mode
             FROM fact_traffic_flow
             WHERE event_id IN {ids:Array(String)}
             """,
             parameters={"ids": event_ids}
         )
 
+        for event_id, _, stored_mode in existing_facts_result.result_rows:
+            if stored_mode != detection_mode:
+                raise RuntimeError(
+                    f"Event {event_id} đã ghi một phần ở chế độ {stored_mode!r}"
+                )
+
         existing_keys = {
             (row[0], int(row[1]))
             for row in existing_facts_result.result_rows
         }
-
         # 3. Prepare new image metadata
         dim_images_data = []
         seen_images = set()
@@ -525,6 +525,11 @@ def get_completed_event_ids(event_ids):
         client.close()
 
 def main():
+    detection_mode = os.getenv("DETECTION_MODE", "").strip().lower()
+    if detection_mode not in {"mock", "yolo"}:
+        raise ValueError("Hãy đặt DETECTION_MODE=mock hoặc DETECTION_MODE=yolo")
+
+    logger.info("Detection mode: %s", detection_mode)
     inbox = Queue(maxsize=1)
     commands = Queue(maxsize=1)
     replies = Queue(maxsize=1)
@@ -581,7 +586,9 @@ def main():
             ]
             traffic_results = (
                 spark.sparkContext.parallelize(spark_input_data)
-                .mapPartitions(process_partition)
+                .mapPartitions(
+                    partial(process_partition, detection_mode=detection_mode)
+                )
                 .collect()
             )
             expected = {(e["event_id"], kind) for e in pending for kind in range(1, 6)}

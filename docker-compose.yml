@@ -61,6 +61,7 @@ services:
     image: traffic-spark:3.4.1
     container_name: image_pipeline_spark_master
     environment:
+      - DETECTION_MODE=${DETECTION_MODE:?Set DETECTION_MODE to mock or yolo}
       - SPARK_MODE=master
       - SPARK_RPC_AUTHENTICATION_ENABLED=no
       - SPARK_MASTER_URL=spark://spark-master:7077
@@ -178,6 +179,7 @@ services:
       airflow-db:
         condition: service_healthy
     environment:
+      - DETECTION_MODE=${DETECTION_MODE:?Set DETECTION_MODE to mock or yolo}
       - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@airflow-db/airflow
       - AIRFLOW__CORE__EXECUTOR=LocalExecutor
       - AIRFLOW__CORE__LOAD_EXAMPLES=False
