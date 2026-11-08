@@ -100,7 +100,15 @@ def rabbitmq_consumer(inbox, commands, replies):
                         headers["x-processing-attempt"] = attempt
                         headers["x-last-error"] = failures[event_id]
 
-                        target_queue = DLQ_NAME if attempt >= 3 else QUEUE_NAME
+                        # Anh khong ton tai: chuyen thang vao DLQ
+                        is_missing_image = "NoSuchKey" in failures[event_id]
+
+                        # Loi tam thoi: retry toi da 3 lan
+                        target_queue = (
+                        DLQ_NAME
+                        if is_missing_image or attempt >= 3
+                        else QUEUE_NAME
+                    )
                         channel.basic_publish(
                             exchange="",
                             routing_key=target_queue,
@@ -484,7 +492,8 @@ def save_to_clickhouse(events, traffic_results, detection_mode):
                     "count",
                     "congestion_level",
                     "image_id",
-                    "inference_time_ms"
+                    "inference_time_ms",
+                    "detection_mode"
                 ]
             )
 
