@@ -39,6 +39,41 @@ except ImportError:
     logger.error("PySpark is not installed. Please install pyspark to run this script.")
     sys.exit(1)
 
+def validate_event(payload):
+    """Reject malformed metadata before it reaches Spark or ClickHouse."""
+    if not isinstance(payload, dict):
+        raise ValueError("Event must be a JSON object")
+    required_strings = (
+        "event_id", "image_id", "bucket", "s3_key", "uploaded_at",
+        "filename", "s3_uri", "mime_type",
+    )
+    for key in required_strings:
+        if not isinstance(payload.get(key), str) or not payload[key].strip():
+            raise ValueError(f"{key} must be a non-empty string")
+    size = payload.get("file_size_bytes")
+    if type(size) is not int or not 0 <= size <= 2**64 - 1:
+        raise ValueError("file_size_bytes must be a UInt64 integer")
+    if not payload["s3_uri"].startswith("s3://"):
+        raise ValueError("s3_uri must start with s3://")
+    if "camera_id" in payload:
+        if not isinstance(payload["camera_id"], str) or not payload["camera_id"].strip():
+            raise ValueError("camera_id must be a non-empty string")
+    for key in ("uploaded_at", "capture_timestamp"):
+        if key not in payload:
+            continue
+        value = payload[key]
+        if not isinstance(value, str):
+            raise ValueError(f"{key} must be an ISO timestamp string")
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError as exc:
+            raise ValueError(f"{key} must be an ISO timestamp string") from exc
+        # ClickHouse DateTime stores seconds in an unsigned 32-bit integer.
+        # Naive timestamps are interpreted using the driver's local timezone.
+        if not 0 <= parsed.timestamp() <= 2**32 - 1:
+            raise ValueError(f"{key} is outside the ClickHouse DateTime range")
+
+
 # The RabbitMQ connection/channel belong exclusively to this thread.
 # Spark may block for a long time on the main thread without starving heartbeats.
 def rabbitmq_consumer(inbox, commands, replies):
@@ -63,17 +98,35 @@ def rabbitmq_consumer(inbox, commands, replies):
 
         events = []
         deliveries = []
-        while len(events) < 50:
+        for _ in range(50):
             method, properties, body = channel.basic_get(queue=QUEUE_NAME, auto_ack=False)
             if method is None:
                 break
-            # Invalid messages remain unacknowledged and are requeued on close.
-            payload = json.loads(body.decode("utf-8"))
-            required = ("event_id", "image_id", "bucket", "s3_key",
-                        "uploaded_at", "filename", "s3_uri",
-                        "file_size_bytes", "mime_type")
-            if not isinstance(payload, dict) or any(k not in payload for k in required):
-                raise ValueError("Invalid RabbitMQ event schema")
+            try:
+                payload = json.loads(body.decode("utf-8"))
+                validate_event(payload)
+            except (ValueError, UnicodeError, OverflowError, OSError) as exc:
+                headers = dict(properties.headers or {})
+                headers["x-error-code"] = "INVALID_EVENT"
+                headers["x-last-error"] = str(exc)[:1000]
+                # Keep the original bytes, even when no event_id can be decoded.
+                # Publication errors must propagate: never ACK before confirmation.
+                channel.basic_publish(
+                    exchange="",
+                    routing_key=DLQ_NAME,
+                    body=body,
+                    properties=pika.BasicProperties(
+                        content_type=properties.content_type,
+                        delivery_mode=2,
+                        message_id=properties.message_id,
+                        headers=headers,
+                    ),
+                    mandatory=True,
+                )
+                channel.basic_ack(delivery_tag=method.delivery_tag, multiple=False)
+                logger.warning("Invalid delivery %s sent to %s: %s",
+                               method.delivery_tag, DLQ_NAME, exc)
+                continue
             events.append(payload)
             deliveries.append((method.delivery_tag, payload["event_id"], body, properties))
 
