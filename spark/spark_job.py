@@ -24,6 +24,7 @@ RABBITMQ_USER = os.getenv("RABBITMQ_USER", "guest")
 RABBITMQ_PASS = os.getenv("RABBITMQ_PASS", "guest")
 QUEUE_NAME = os.getenv("RABBITMQ_QUEUE", "image_processing_queue")
 DLQ_NAME = f"{QUEUE_NAME}.dlq"
+PERMANENT_IMAGE_ERRORS = frozenset({"EMPTY_IMAGE", "INVALID_IMAGE", "IMAGE_NOT_FOUND"})
 
 CLICKHOUSE_HOST = os.getenv("CLICKHOUSE_HOST", "localhost")
 CLICKHOUSE_PORT = int(os.getenv("CLICKHOUSE_PORT", "8123"))
@@ -38,6 +39,35 @@ try:
 except ImportError:
     logger.error("PySpark is not installed. Please install pyspark to run this script.")
     sys.exit(1)
+
+class ImageDataError(ValueError):
+    """An image payload that cannot be processed by retrying the same event."""
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+def decode_image(data):
+    """Fully validate and decode an image in both mock and YOLO modes."""
+    import io
+    from PIL import Image, UnidentifiedImageError
+
+    if not data:
+        raise ImageDataError("EMPTY_IMAGE", "Image object contains no bytes")
+    try:
+        # Verify the file structure, then reopen because verify() consumes it.
+        with Image.open(io.BytesIO(data)) as image:
+            image.verify()
+        with Image.open(io.BytesIO(data)) as image:
+            image.load()
+            return image.convert("RGB")
+    except (UnidentifiedImageError, OSError, SyntaxError, ValueError,
+            Image.DecompressionBombError) as exc:
+        # This catch surrounds only in-memory image decoding, not downloads or
+        # inference: infrastructure/model failures must still fail the Spark task.
+        raise ImageDataError("INVALID_IMAGE", f"Cannot decode image: {exc}") from exc
+
 
 def validate_event(payload):
     """Reject malformed metadata before it reaches Spark or ClickHouse."""
@@ -147,21 +177,20 @@ def rabbitmq_consumer(inbox, commands, replies):
 
                 for tag, event_id, body, properties in deliveries:
                     if event_id in failures:
+                        failure = failures[event_id]
                         headers = dict(properties.headers or {})
                         attempt = int(headers.get("x-processing-attempt", 0)) + 1
 
                         headers["x-processing-attempt"] = attempt
-                        headers["x-last-error"] = failures[event_id]
+                        headers["x-error-code"] = failure["code"]
+                        headers["x-last-error"] = failure["message"][:1000]
 
-                        # Anh khong ton tai: chuyen thang vao DLQ
-                        is_missing_image = "NoSuchKey" in failures[event_id]
-
-                        # Loi tam thoi: retry toi da 3 lan
+                        # Invalid image data cannot recover by retrying unchanged.
                         target_queue = (
-                        DLQ_NAME
-                        if is_missing_image or attempt >= 3
-                        else QUEUE_NAME
-                    )
+                            DLQ_NAME
+                            if failure["code"] in PERMANENT_IMAGE_ERRORS or attempt >= 3
+                            else QUEUE_NAME
+                        )
                         channel.basic_publish(
                             exchange="",
                             routing_key=target_queue,
@@ -217,7 +246,6 @@ def process_partition(iterator, detection_mode):
     Processes a partition of events: downloads images from MinIO,
     runs YOLOv8 object detection (or mock detection), and yields metrics.
     """
-    import io
     from minio.error import S3Error
     
     # Initialize MinIO client inside worker partition
@@ -239,7 +267,6 @@ def process_partition(iterator, detection_mode):
         if not model_path.is_file():
             raise FileNotFoundError(f"Thiếu model YOLOv8: {model_path}")
 
-        from PIL import Image
         from ultralytics import YOLO
 
         model = YOLO(str(model_path))
@@ -265,6 +292,7 @@ def process_partition(iterator, detection_mode):
             'Pedestrian': 0
         }
 
+        img = None
         try:
             # 1. Fetch image from MinIO
             response = None
@@ -272,10 +300,6 @@ def process_partition(iterator, detection_mode):
                 response = minio_client.get_object(bucket, s3_key)
                 img_data = response.read()
 
-                if not img_data:
-                    raise ValueError(
-                        f"Empty image data: bucket={bucket}, key={s3_key}"
-                    )
             finally:
                 if response is not None:
                     try:
@@ -283,10 +307,9 @@ def process_partition(iterator, detection_mode):
                     finally:
                         response.release_conn()
 
+            img = decode_image(img_data)
             if detection_mode == "yolo":
                 # 2. Run real YOLOv8 object detection
-                img_io = io.BytesIO(img_data)
-                img = Image.open(img_io)
                 results = model(img)
                 
                 # YOLO COCO class indices:
@@ -359,11 +382,19 @@ def process_partition(iterator, detection_mode):
 
             reason = f"MinIO {exc.code}: {bucket}/{s3_key}"
             logger.warning("Image missing for event %s: %s", event_id, reason)
-            yield event_id, [], reason
+            yield event_id, [], {"code": "IMAGE_NOT_FOUND", "message": reason}
+            continue
+        except ImageDataError as exc:
+            reason = f"{bucket}/{s3_key}: {exc}"
+            logger.warning("Invalid image for event %s (%s): %s", event_id, exc.code, reason)
+            yield event_id, [], {"code": exc.code, "message": reason}
             continue
         except Exception:
             logger.exception("Error processing image %s", image_id)
             raise
+        finally:
+            if img is not None:
+                img.close()
 
         inference_time_ms = int((time.time() - start_time) * 1000)
         

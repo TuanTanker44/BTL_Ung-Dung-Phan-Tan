@@ -33,10 +33,11 @@ def valid_event():
 
 
 class ConsumerTests(unittest.TestCase):
-    def run_consumer(self, bodies, publish_error=None):
+    def run_consumer(self, bodies, publish_error=None, failures=None, headers=None):
         channel = MagicMock()
         properties = SimpleNamespace(
-            headers={"source": "test"}, content_type="application/json", message_id="original-id"
+            headers={"source": "test", **(headers or {})},
+            content_type="application/json", message_id="original-id"
         )
         channel.basic_get.side_effect = [
             (SimpleNamespace(delivery_tag=i), properties, body)
@@ -51,7 +52,7 @@ class ConsumerTests(unittest.TestCase):
         pika.PlainCredentials = MagicMock()
         pika.BasicProperties = lambda **kw: SimpleNamespace(**kw)
         inbox, commands, replies = Queue(), Queue(), Queue()
-        commands.put(("COMPLETE", {}))
+        commands.put(("COMPLETE", failures or {}))
         with patch.dict("sys.modules", {"pika": pika}), patch.object(job, "logger"):
             job.rabbitmq_consumer(inbox, commands, replies)
         return channel, connection, inbox.get_nowait(), replies
@@ -119,6 +120,63 @@ class ConsumerTests(unittest.TestCase):
         self.assertEqual(events, [event])
         channel.basic_publish.assert_not_called()
         channel.basic_ack.assert_called_once_with(delivery_tag=1, multiple=False)
+
+    def test_permanent_image_errors_go_directly_to_dlq(self):
+        bad = valid_event()
+        good = {**valid_event(), "event_id": "good-event"}
+        bodies = [json.dumps(e).encode() for e in [bad, good]]
+        for code in ("EMPTY_IMAGE", "INVALID_IMAGE", "IMAGE_NOT_FOUND"):
+            with self.subTest(code=code):
+                failure = {"event-1": {"code": code, "message": "image failed"}}
+                channel, _, (events, error), replies = self.run_consumer(
+                    bodies, failures=failure,
+                )
+                self.assertIsNone(error)
+                self.assertEqual(events, [bad, good])
+                self.assertIsNone(replies.get_nowait())
+                channel.confirm_delivery.assert_called_once()
+                publication = channel.basic_publish.call_args.kwargs
+                self.assertEqual(publication["routing_key"], job.DLQ_NAME)
+                self.assertEqual(publication["body"], bodies[0])
+                self.assertTrue(publication["mandatory"])
+                props = publication["properties"]
+                self.assertEqual(props.delivery_mode, 2)
+                self.assertEqual(props.message_id, "event-1")
+                self.assertEqual(props.headers["x-error-code"], code)
+                self.assertEqual(props.headers["x-last-error"], "image failed")
+                self.assertEqual(props.headers["x-processing-attempt"], 1)
+                self.assertEqual(props.headers["source"], "test")
+                actions = [call[0] for call in channel.method_calls]
+                self.assertLess(actions.index("basic_publish"), actions.index("basic_ack"))
+                self.assertEqual(
+                    [call.kwargs["delivery_tag"] for call in channel.basic_ack.call_args_list],
+                    [1, 2],
+                )
+
+    def test_image_dlq_publish_failure_does_not_ack_original(self):
+        body = json.dumps(valid_event()).encode()
+        channel, connection, (_, error), replies = self.run_consumer(
+            [body], publish_error=RuntimeError("broker confirmation failed"),
+            failures={"event-1": {"code": "INVALID_IMAGE", "message": "bad image"}},
+        )
+        self.assertIsNone(error)  # Fetch succeeded; completion failed afterwards.
+        self.assertIsInstance(replies.get_nowait(), RuntimeError)
+        channel.basic_ack.assert_not_called()
+        connection.close.assert_called_once()
+
+    def test_non_permanent_failure_uses_code_not_message_to_retry(self):
+        body = json.dumps(valid_event()).encode()
+        for previous, target in [(0, job.QUEUE_NAME), (2, job.DLQ_NAME)]:
+            with self.subTest(previous=previous):
+                channel, _, _, replies = self.run_consumer(
+                    [body], headers={"x-processing-attempt": previous},
+                    failures={"event-1": {
+                        "code": "TEMPORARY_ERROR", "message": "text contains NoSuchKey",
+                    }},
+                )
+                self.assertIsNone(replies.get_nowait())
+                self.assertEqual(channel.basic_publish.call_args.kwargs["routing_key"], target)
+                channel.basic_ack.assert_called_once()
 
 
 if __name__ == "__main__":
