@@ -25,19 +25,6 @@ function Test-Port($port) {
     }
 }
 
-function Wait-Port($port, $name, $timeoutSeconds = 90) {
-    Write-Host "   Đang chờ $name (cổng $port)..." -ForegroundColor Gray
-    $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    while ($sw.Elapsed.TotalSeconds -lt $timeoutSeconds) {
-        if (Test-Port $port) {
-            Write-Host "✅ $name sẵn sàng (cổng $port)." -ForegroundColor Green
-            return
-        }
-        Start-Sleep -Seconds 2
-    }
-    Fail "$name không phản hồi trên cổng $port sau $timeoutSeconds giây. Kiểm tra bằng: docker-compose logs"
-}
-
 # 0. Tìm Python trong venv (thư mục dự án hoặc thư mục cha) và kiểm tra thư viện
 Write-Host "`n0. Kiểm tra môi trường Python (venv)..." -ForegroundColor Blue
 $venvPython = @("$PSScriptRoot\venv\Scripts\python.exe", "$PSScriptRoot\..\venv\Scripts\python.exe") |
@@ -45,7 +32,7 @@ $venvPython = @("$PSScriptRoot\venv\Scripts\python.exe", "$PSScriptRoot\..\venv\
 if (-not $venvPython) {
     Fail "Không tìm thấy venv. Hãy tạo bằng: python -m venv venv"
 }
-& $venvPython -c "import grpc, minio, pika, clickhouse_connect, streamlit, plotly, pandas" 2>$null
+& $venvPython -c "import grpc, grpc_health, minio, pika, clickhouse_connect, streamlit, streamlit_autorefresh, plotly, pandas" 2>$null
 if ($LASTEXITCODE -ne 0) {
     Fail "Thiếu thư viện Python trong venv. Chạy: $venvPython -m pip install -r requirements.txt"
 }
@@ -62,20 +49,26 @@ Write-Host "✅ Docker đang hoạt động." -ForegroundColor Green
 
 # 2. Khởi động Docker Compose
 Write-Host "`n2. Khởi chạy các container nền (ClickHouse, MinIO, RabbitMQ, Spark)..." -ForegroundColor Blue
-docker-compose up -d
-if ($LASTEXITCODE -ne 0) { Fail "Lỗi khởi động docker-compose." }
+docker compose up -d
+if ($LASTEXITCODE -ne 0) { Fail "Lỗi khởi động docker compose." }
 
-# 3. Chờ các dịch vụ thực sự sẵn sàng (thay cho Start-Sleep cố định)
-Write-Host "`n3. Chờ ClickHouse, RabbitMQ và MinIO sẵn sàng..." -ForegroundColor Blue
-Wait-Port 8123 "ClickHouse"
-Wait-Port 5672 "RabbitMQ"
-Wait-Port 9000 "MinIO"
+# 3. Kiểm tra trạng thái ứng dụng, Spark worker và Airflow scheduler
+Write-Host "`n3. Chờ toàn bộ hạ tầng đạt trạng thái healthy..." -ForegroundColor Blue
+& $venvPython scripts/verify_services.py infrastructure --timeout 240
+if ($LASTEXITCODE -ne 0) { Fail "Hạ tầng chưa sẵn sàng. Kiểm tra: docker compose logs" }
 
-# 4. Cài đặt thư viện Python trong Spark Master
-Write-Host "`n4. Cài đặt các thư viện cần thiết vào Spark Master container..." -ForegroundColor Blue
-docker exec -u 0 -t image_pipeline_spark_master pip install -r /opt/spark-jobs/requirements.txt
-if ($LASTEXITCODE -ne 0) { Fail "Thất bại khi cài đặt thư viện vào Spark container." }
-Write-Host "✅ Cài đặt thư viện Spark thành công." -ForegroundColor Green
+# 4. Áp dụng migration ClickHouse và kiểm tra dependency driver/worker
+Write-Host "`n4. Áp dụng migration ClickHouse..." -ForegroundColor Blue
+Get-Content -LiteralPath "clickhouse/migrations/001_add_detection_mode.sql" -Raw |
+    docker exec -i image_pipeline_clickhouse clickhouse-client --multiquery
+if ($LASTEXITCODE -ne 0) { Fail "Migration 001 thất bại." }
+Get-Content -LiteralPath "clickhouse/migrations/002_make_traffic_facts_idempotent.sql" -Raw |
+    docker exec -i image_pipeline_clickhouse clickhouse-client --multiquery
+if ($LASTEXITCODE -ne 0) { Fail "Migration 002 thất bại." }
+
+& $venvPython scripts/verify_dependencies.py
+if ($LASTEXITCODE -ne 0) { Fail "Dependency host/Spark/Airflow không tương thích." }
+Write-Host "✅ Migration và dependency hợp lệ." -ForegroundColor Green
 
 # 5. Khởi động gRPC Server trong nền (có log và kiểm tra cổng)
 Write-Host "`n5. Đang chạy gRPC Server (ingestion/server.py) trong nền..." -ForegroundColor Blue
@@ -84,7 +77,6 @@ if (Test-Port 50051) {
 } else {
     $grpc = Start-Process -FilePath $venvPython -ArgumentList "ingestion/server.py" -WindowStyle Hidden -PassThru `
         -RedirectStandardOutput "$PSScriptRoot\ingestion_server.log" -RedirectStandardError "$PSScriptRoot\ingestion_server.err.log"
-    Wait-Port 50051 "gRPC Server" 30
     Write-Host "   PID: $($grpc.Id) | Log: ingestion_server.err.log" -ForegroundColor Gray
 }
 
@@ -95,10 +87,11 @@ if (Test-Port 8501) {
 } else {
     $dash = Start-Process -FilePath $venvPython -ArgumentList "-m","streamlit","run","dashboard.py","--server.headless","true" -WindowStyle Hidden -PassThru `
         -RedirectStandardOutput "$PSScriptRoot\dashboard.log" -RedirectStandardError "$PSScriptRoot\dashboard.err.log"
-    Wait-Port 8501 "Web Dashboard" 30
     Write-Host "   PID: $($dash.Id) | Log: dashboard.err.log" -ForegroundColor Gray
 }
-Start-Process "http://localhost:8501"
+
+& $venvPython scripts/verify_services.py applications --timeout 60
+if ($LASTEXITCODE -ne 0) { Fail "gRPC Server hoặc Dashboard chưa healthy." }
 
 Write-Host "`n========================================================" -ForegroundColor Cyan
 Write-Host "🎉 HỆ THỐNG ĐÃ SẴN SÀNG!" -ForegroundColor Green

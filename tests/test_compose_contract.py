@@ -30,6 +30,16 @@ class ComposeContractTests(unittest.TestCase):
         self.assertIn("DASHBOARD_REFRESH_SECONDS", dashboard)
         self.assertIn("st.sidebar.toggle(", dashboard)
 
+    def test_start_scripts_verify_services_and_apply_migrations(self):
+        for name in ("start_pipeline.ps1", "start_pipeline.sh"):
+            script = (ROOT / name).read_text(encoding="utf-8")
+            self.assertIn("verify_services.py infrastructure", script)
+            self.assertIn("verify_services.py applications", script)
+            self.assertIn("verify_dependencies.py", script)
+            self.assertIn("001_add_detection_mode.sql", script)
+            self.assertIn("002_make_traffic_facts_idempotent.sql", script)
+            self.assertNotIn("pip install -r /opt/spark-jobs/requirements.txt", script)
+
 
 if __name__ == "__main__":
     unittest.main()

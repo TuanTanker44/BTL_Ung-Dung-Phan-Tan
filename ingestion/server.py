@@ -41,6 +41,7 @@ sys.path.insert(0, GEN_DIR)
 
 try:
     import grpc
+    from grpc_health.v1 import health, health_pb2, health_pb2_grpc
     # pyrefly: ignore [missing-import]
     import image_ingestion_pb2
     # pyrefly: ignore [missing-import]
@@ -230,6 +231,9 @@ def serve():
     image_ingestion_pb2_grpc.add_ImageIngestionServiceServicer_to_server(
         ImageIngestionService(), server
     )
+    health_service = health.HealthServicer()
+    health_pb2_grpc.add_HealthServicer_to_server(health_service, server)
+    health_service.set("", health_pb2.HealthCheckResponse.SERVING)
     port = "[::]:50051"
     server.add_insecure_port(port)
     logger.info(f"gRPC server starting on port 50051...")

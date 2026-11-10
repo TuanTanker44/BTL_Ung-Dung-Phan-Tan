@@ -16,6 +16,16 @@ def load_server():
     grpc.StatusCode = types.SimpleNamespace(INTERNAL="INTERNAL", UNAVAILABLE="UNAVAILABLE")
     grpc.server = lambda *args, **kwargs: None
 
+    grpc_health = types.ModuleType("grpc_health")
+    grpc_health_v1 = types.ModuleType("grpc_health.v1")
+    grpc_health_v1.health = types.SimpleNamespace(HealthServicer=object)
+    grpc_health_v1.health_pb2 = types.SimpleNamespace(
+        HealthCheckResponse=types.SimpleNamespace(SERVING=1)
+    )
+    grpc_health_v1.health_pb2_grpc = types.SimpleNamespace(
+        add_HealthServicer_to_server=lambda *args: None
+    )
+
     grpc_tools = types.ModuleType("grpc_tools")
     grpc_tools.protoc = types.SimpleNamespace(main=lambda *args: 0)
 
@@ -38,6 +48,8 @@ def load_server():
 
     stubs = {
         "grpc": grpc,
+        "grpc_health": grpc_health,
+        "grpc_health.v1": grpc_health_v1,
         "grpc_tools": grpc_tools,
         "image_ingestion_pb2": pb2,
         "image_ingestion_pb2_grpc": pb2_grpc,
