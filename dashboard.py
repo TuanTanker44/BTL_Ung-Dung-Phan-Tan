@@ -16,6 +16,7 @@ import clickhouse_connect
 from minio import Minio
 # pyrefly: ignore [missing-import]
 from PIL import Image
+from dashboard_metrics import calculate_kpis
 
 # Streamlit Page Configuration
 st.set_page_config(
@@ -35,7 +36,6 @@ CLICKHOUSE_PASSWORD = os.getenv("CLICKHOUSE_PASSWORD", "traffic_password")
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "localhost:9000")
 MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin")
-VEHICLE_TYPE_NAMES = ["Car", "Motorcycle", "Bus", "Truck"]
 AUTO_REFRESH_SECONDS = max(5, int(os.getenv("DASHBOARD_REFRESH_SECONDS", "10")))
 
 # Custom premium styling overrides (Neon Theme)
@@ -175,18 +175,30 @@ def fetch_dashboard_data(detection_mode):
         
         # 5. Time series traffic flow
         time_series = client.query_df("""
+            WITH event_metrics AS (
+                SELECT
+                    event_id,
+                    min(timestamp) AS timestamp,
+                    any(camera_id) AS camera_id,
+                    sumIf(count, vehicle_type_id IN (1, 2, 3, 4)) AS vehicle_detections,
+                    any(inference_time_ms) AS inference_time_ms
+                FROM fact_traffic_flow FINAL
+                WHERE detection_mode = {mode:String}
+                GROUP BY event_id
+            )
             SELECT
-                f.timestamp AS timestamp,
-                f.camera_id AS camera_id,
+                e.timestamp AS timestamp,
+                e.camera_id AS camera_id,
                 c.location AS location,
-                sumIf(f.count, f.vehicle_type_id IN (1, 2, 3, 4)) AS total_vehicles,
-                avg(f.inference_time_ms) AS avg_inference
-            FROM (SELECT * FROM fact_traffic_flow FINAL) AS f
+                sum(e.vehicle_detections) AS total_vehicles,
+                avg(e.inference_time_ms) AS avg_inference,
+                sum(e.inference_time_ms) AS inference_time_sum_ms,
+                count() AS processed_frames
+            FROM event_metrics AS e
             JOIN (SELECT * FROM dim_cameras FINAL) AS c
-                ON f.camera_id = c.camera_id
-            WHERE f.detection_mode = {mode:String}
-            GROUP BY f.timestamp, f.camera_id, c.location
-            ORDER BY f.timestamp ASC
+                ON e.camera_id = c.camera_id
+            GROUP BY e.timestamp, e.camera_id, c.location
+            ORDER BY e.timestamp ASC
         """, parameters={"mode": detection_mode})
         
         # 6. Latest Images list (for details pane)
@@ -285,11 +297,9 @@ else:
         filtered_images = images_df
 
     # --- KPI tính theo bộ lọc camera đang chọn ---
-    vehicle_rows = filtered_summary[filtered_summary["vehicle_type_name"].isin(VEHICLE_TYPE_NAMES)]
-    kpi_cameras = filtered_summary["camera_id"].nunique()
-    kpi_frames = filtered_images["image_id"].nunique()
-    kpi_vehicles = int(vehicle_rows["total_count"].sum())
-    kpi_infer = round(float(filtered_ts["avg_inference"].mean()), 1) if not filtered_ts.empty else 0
+    kpi_cameras, kpi_frames, kpi_vehicles, kpi_infer = calculate_kpis(
+        filtered_summary, filtered_ts
+    )
 
     # --- Top KPI Metrics ---
     col1, col2, col3, col4 = st.columns(4)
@@ -310,7 +320,7 @@ else:
     with col3:
         st.markdown(f"""
             <div class="metric-container">
-                <div class="metric-lbl">Tổng Số Xe (Không Gồm Người Đi Bộ)</div>
+                <div class="metric-lbl">Tổng Lượt Phát Hiện Xe (Không Gồm Người Đi Bộ)</div>
                 <div class="metric-val">{kpi_vehicles}</div>
             </div>
         """, unsafe_allow_html=True)
@@ -341,7 +351,7 @@ else:
                     y="total_vehicles",
                     color="location" if selected_camera == "Tất cả camera" else None,
                     title="Số lượng phương tiện lưu thông qua các khung giờ",
-                    labels={"timestamp": "Thời gian", "total_vehicles": "Tổng số xe"},
+                    labels={"timestamp": "Thời gian", "total_vehicles": "Lượt phương tiện được phát hiện"},
                     markers=True,
                     color_discrete_sequence=px.colors.qualitative.Plotly
                 )
