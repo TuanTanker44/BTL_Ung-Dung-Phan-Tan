@@ -131,7 +131,8 @@ services:
     image: apache/airflow:2.6.3-python3.9
     container_name: image_pipeline_airflow_init
     depends_on:
-      - airflow-db
+      airflow-db:
+        condition: service_healthy
     environment:
       - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@airflow-db/airflow
       - AIRFLOW__CORE__EXECUTOR=LocalExecutor
@@ -139,14 +140,19 @@ services:
     command:
       - -c
       - |
-        airflow db init
+        set -e
+        airflow db migrate
         airflow users create \
           --username admin \
           --firstname Admin \
           --lastname User \
           --role Admin \
           --email admin@example.com \
+          --password admin \
+        || airflow users reset-password \
+          --username admin \
           --password admin
+    restart: "no"
 
   # --- Apache Airflow Webserver ---
   airflow-webserver:
@@ -155,6 +161,8 @@ services:
     depends_on:
       airflow-db:
         condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
     environment:
       - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@airflow-db/airflow
       - AIRFLOW__CORE__EXECUTOR=LocalExecutor
@@ -181,6 +189,8 @@ services:
     depends_on:
       airflow-db:
         condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
     environment:
       - DETECTION_MODE=${DETECTION_MODE:?Set DETECTION_MODE to mock or yolo}
       - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@airflow-db/airflow
