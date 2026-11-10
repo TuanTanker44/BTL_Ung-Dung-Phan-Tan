@@ -22,6 +22,14 @@ class ComposeContractTests(unittest.TestCase):
         self.assertIn("airflow db migrate", init)
         self.assertIn("airflow users reset-password", init)
 
+    def test_dashboard_has_an_actual_periodic_rerun(self):
+        dashboard = (ROOT / "dashboard.py").read_text(encoding="utf-8")
+        requirements = (ROOT / "requirements.txt").read_text(encoding="utf-8")
+        self.assertIn("streamlit-autorefresh", requirements)
+        self.assertIn("st_autorefresh(", dashboard)
+        self.assertIn("DASHBOARD_REFRESH_SECONDS", dashboard)
+        self.assertIn("st.sidebar.toggle(", dashboard)
+
 
 if __name__ == "__main__":
     unittest.main()

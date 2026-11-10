@@ -4,6 +4,8 @@ import pandas as pd
 # pyrefly: ignore [missing-import]
 import streamlit as st
 # pyrefly: ignore [missing-import]
+from streamlit_autorefresh import st_autorefresh
+# pyrefly: ignore [missing-import]
 import plotly.express as px
 # pyrefly: ignore [missing-import]
 import plotly.graph_objects as go
@@ -34,6 +36,7 @@ MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "localhost:9000")
 MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin")
 VEHICLE_TYPE_NAMES = ["Car", "Motorcycle", "Bus", "Truck"]
+AUTO_REFRESH_SECONDS = max(5, int(os.getenv("DASHBOARD_REFRESH_SECONDS", "10")))
 
 # Custom premium styling overrides (Neon Theme)
 st.markdown("""
@@ -238,6 +241,18 @@ detection_mode = st.sidebar.selectbox(
     list(mode_labels),
     format_func=mode_labels.get,
 )
+
+auto_refresh = st.sidebar.toggle(
+    "Tự động làm mới dữ liệu",
+    value=True,
+    help=f"Chạy lại dashboard mỗi {AUTO_REFRESH_SECONDS} giây.",
+)
+if auto_refresh:
+    st_autorefresh(
+        interval=AUTO_REFRESH_SECONDS * 1000,
+        limit=None,
+        key="dashboard-data-refresh",
+    )
 
 st.caption(f"Đang hiển thị: {mode_labels[detection_mode]}")
 cameras_df, traffic_summary, congestion_levels, time_series, images_df = fetch_dashboard_data(detection_mode)
