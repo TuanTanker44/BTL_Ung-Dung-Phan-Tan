@@ -98,7 +98,7 @@ python -m venv venv
   ./start_pipeline.sh
   ```
 
-*Script sẽ tự động khởi động các container Docker, cài đặt dependencies cho Spark Master, bật gRPC Ingestion Server và tự động mở giao diện Web Dashboard trên trình duyệt của bạn.*
+*Script sẽ build/khởi động container, áp dụng migration, kiểm tra dependency giữa Spark driver/worker, xác minh readiness của từng dịch vụ rồi bật gRPC Ingestion Server và Dashboard.*
 
 ---
 
@@ -120,6 +120,16 @@ Vì lý do tương thích môi trường Java trên Windows, Spark Job được 
 docker exec -e MINIO_ENDPOINT=minio:9000 -e RABBITMQ_HOST=rabbitmq -e CLICKHOUSE_HOST=clickhouse -t image_pipeline_spark_master spark-submit /opt/spark-jobs/spark_job.py
 ```
 *Spark sẽ đọc tin nhắn sự kiện từ RabbitMQ, tải ảnh từ MinIO, sử dụng mô hình đếm xe AI và ghi nhận kết quả đa chiều vào ClickHouse.*
+
+### Kiểm thử end-to-end và bằng chứng Spark worker
+
+Sau khi pipeline đã healthy, chạy smoke test sau trên Codespace/Linux hoặc Windows có Docker:
+
+```bash
+python scripts/e2e_smoke_test.py --output artifacts/e2e-evidence.json
+```
+
+Kiểm thử gửi một JPEG hợp lệ qua gRPC, quan sát executor đang dùng core trên Spark worker, chạy job ở chế độ `mock`, rồi xác nhận ClickHouse có đúng 5 nhóm phương tiện cho `image_id` vừa gửi. File JSON đầu ra là bằng chứng có thể lưu cùng kết quả kiểm thử.
 
 ---
 
@@ -161,12 +171,12 @@ Mặc dù dự án đã triển khai hoàn chỉnh kiến trúc End-to-End từ 
 
 ### 1. 🔄 Tiếp nhận & Luồng dữ liệu (Data Ingestion & Streaming)
 * **Chưa có True Streaming**: PySpark Job hiện tại gom message từ RabbitMQ bằng kịch bản micro-batch pulling (`basic_get`), dẫn tới cổ chai ở Spark Driver khi volume ảnh lớn. Cần nâng cấp lên **Spark Structured Streaming** liên tục.
-* **Thiếu Dead Letter Queue (DLQ)**: Khi dữ liệu bị hỏng/lỗi schema, hệ thống nack/log lỗi chứ chưa đẩy vào DLQ để theo dõi và xử lý lại (re-process).
+* **DLQ cần công cụ vận hành**: Pipeline đã cô lập lỗi schema/ảnh hỏng vào DLQ, nhưng chưa có giao diện quản trị để duyệt và phát lại message.
 * **Hạn chế của RabbitMQ**: Đối với hệ thống giám sát hàng nghìn camera thời gian thực, cần cân nhắc chuyển đổi hoặc tích hợp **Apache Kafka / Redpanda** để hỗ trợ log streaming throughput cao và khả năng replay dữ liệu.
 
 ### 2. 🏛️ Mô hình hóa & Tối ưu Data Warehouse (ClickHouse DW)
 * **Thiếu Partitioning & TTL**: Bảng `fact_traffic_flow` chưa được phân vùng `PARTITION BY toYYYYMM(timestamp)` và chưa cài đặt chính sách nén/xóa tự động dữ liệu cũ (`TTL`).
-* **Tính nhất quán & Chống lặp dữ liệu (Idempotency)**: Nếu Spark Job bị lỗi rớt giữa chừng sau khi insert ClickHouse nhưng trước khi ACK RabbitMQ, message sẽ được gửi lại gây ghi trùng lặp dữ liệu (Duplicate Data). Cần áp dụng ClickHouse Deduplication Key hoặc `ReplacingMergeTree`.
+* **Chi phí khử trùng khi đọc**: Bảng fact dùng `ReplacingMergeTree` theo `(event_id, vehicle_type_id)` và truy vấn `FINAL` để retry/concurrent write không nhân đôi KPI. Khi dữ liệu lớn hơn, nên bổ sung materialized view đã hợp nhất để giảm chi phí `FINAL`.
 * **Thiếu Materialized Views**: Streamlit Dashboard hiện đang tính toán trực tiếp từ bảng raw fact. Cần xây dựng các ClickHouse Materialized Views (pre-aggregations theo giờ/ngày/camera) để tối ưu tốc độ truy vấn dashboard.
 
 ### 3. 🛡️ Chất lượng Dữ liệu & Giám sát (Data Quality & Monitoring)

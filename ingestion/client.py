@@ -44,14 +44,8 @@ except ImportError:
     # pyrefly: ignore [missing-import]
     import image_ingestion_pb2_grpc
 
-# Pillow is optional, fallback to random bytes if not installed
-try:
-    # pyrefly: ignore [missing-import]
-    from PIL import Image, ImageDraw, ImageFont
-    HAS_PILLOW = True
-except ImportError:
-    HAS_PILLOW = False
-    logger.warning("Pillow is not installed. Dummy traffic images will contain random bytes.")
+# pyrefly: ignore [missing-import]
+from PIL import Image, ImageDraw
 
 
 def create_dummy_traffic_image(camera_id, vehicle_counts):
@@ -59,9 +53,6 @@ def create_dummy_traffic_image(camera_id, vehicle_counts):
     Creates a simulated traffic image.
     Draws a gray road with lanes and colored rectangles representing detected vehicles.
     """
-    if not HAS_PILLOW:
-        return bytes([random.randint(0, 255) for _ in range(5000)])
-
     # 1. Create dark asphalt road background
     img = Image.new('RGB', (640, 480), color=(50, 50, 50))
     d = ImageDraw.Draw(img)

@@ -11,6 +11,11 @@ SPEC = importlib.util.spec_from_file_location(
 )
 VERIFY = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(VERIFY)
+E2E_SPEC = importlib.util.spec_from_file_location(
+    "e2e_smoke_test", ROOT / "scripts" / "e2e_smoke_test.py"
+)
+E2E = importlib.util.module_from_spec(E2E_SPEC)
+E2E_SPEC.loader.exec_module(E2E)
 
 
 class ServiceVerificationTests(unittest.TestCase):
@@ -46,6 +51,18 @@ class ServiceVerificationTests(unittest.TestCase):
 
         with mock.patch.object(VERIFY, "http_get", side_effect=response):
             VERIFY.check_infrastructure()
+
+    def test_e2e_worker_evidence_requires_alive_worker_with_executor_activity(self):
+        snapshot = {
+            "workers": [
+                {"id": "idle", "host": "w1", "state": "ALIVE", "coresused": 0},
+                {"id": "busy", "host": "w2", "state": "ALIVE", "coresused": 1},
+                {"id": "dead", "host": "w3", "state": "DEAD", "coresused": 2},
+            ]
+        }
+        self.assertEqual(E2E.active_workers(snapshot), [
+            {"id": "busy", "host": "w2", "coresused": 1}
+        ])
 
 
 if __name__ == "__main__":
