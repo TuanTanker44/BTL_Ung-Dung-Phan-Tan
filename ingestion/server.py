@@ -116,7 +116,7 @@ class ImageIngestionService(image_ingestion_pb2_grpc.ImageIngestionServiceServic
                 with pika.BlockingConnection(self.rabbitmq_params) as connection:
                     channel = connection.channel()
                     channel.confirm_delivery()  # broker xác nhận đã nhận tin
-                    channel.basic_publish(
+                    confirmed = channel.basic_publish(
                         exchange="",
                         routing_key=QUEUE_NAME,
                         body=json.dumps(payload),
@@ -127,6 +127,8 @@ class ImageIngestionService(image_ingestion_pb2_grpc.ImageIngestionServiceServic
                         ),
                         mandatory=True,
                     )
+                    if confirmed is False:
+                        raise RuntimeError("RabbitMQ rejected the published event")
                 return
             except Exception as e:
                 last_err = e
@@ -191,17 +193,26 @@ class ImageIngestionService(image_ingestion_pb2_grpc.ImageIngestionServiceServic
             logger.info(f"Published ingestion event to RabbitMQ for image: {image_id}")
         except Exception as e:
             logger.error(f"Failed to publish event to RabbitMQ for image {image_id}: {e}")
-            # Bù trừ: xóa ảnh mồ côi để MinIO và RabbitMQ luôn nhất quán
-            try:
-                self.minio_client.remove_object(BUCKET_NAME, s3_key)
-                logger.info(f"Rolled back MinIO object: {s3_key}")
-            except Exception as cleanup_err:
-                logger.error(f"Cleanup failed for {s3_key}: {cleanup_err}")
+            # A connection can fail after RabbitMQ persisted the message but before
+            # the publisher received the confirm. Deleting the object here would
+            # leave a valid queued event pointing at missing data. Retain it so a
+            # confirmed retry of this event (same event_id/message_id) remains safe.
+            logger.warning(
+                "Publish outcome is unknown; retaining MinIO object for reconciliation: %s",
+                s3_key,
+            )
             context.set_code(grpc.StatusCode.UNAVAILABLE)
-            context.set_details(f"RabbitMQ Publish Error: {str(e)}")
+            context.set_details(
+                f"RabbitMQ publish outcome unknown for event {event_id}: {str(e)}"
+            )
             return image_ingestion_pb2.ImageUploadResponse(
+                image_id=image_id,
+                s3_uri=s3_uri,
                 status="FAILED",
-                message="Queue unavailable, please retry."
+                message=(
+                    "Queue confirmation unavailable; the image was retained. "
+                    f"Retry safely with event reference {event_id}."
+                )
             )
             
 
