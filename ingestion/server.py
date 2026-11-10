@@ -6,6 +6,7 @@ import logging
 from concurrent import futures
 from datetime import datetime
 import io
+import importlib
 import time
 
 # Setup logging
@@ -25,13 +26,18 @@ try:
     # pyrefly: ignore [missing-import]
     from grpc_tools import protoc
     logger.info("Compiling Protobuf definitions...")
-    protoc.main((
+    result = protoc.main((
         '',
         f'-I{PROTO_DIR}',
         f'--python_out={GEN_DIR}',
         f'--grpc_python_out={GEN_DIR}',
         PROTO_FILE,
     ))
+    if result != 0:
+        raise RuntimeError(
+            f"Protobuf compilation failed with exit code {result}: {PROTO_FILE}"
+        )
+    importlib.invalidate_caches()
     # Correct import paths inside generated files if needed
     # (sometimes necessary in python packages, but here simple path insert is enough)
 except ImportError:

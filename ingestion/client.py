@@ -1,5 +1,6 @@
 import os
 import sys
+import importlib
 import time
 import random
 import logging
@@ -16,29 +17,40 @@ PROTO_DIR = os.path.join(CURRENT_DIR, "protos")
 GEN_DIR = os.path.join(CURRENT_DIR, "generated")
 PROTO_FILE = os.path.join(PROTO_DIR, "image_ingestion.proto")
 
+os.makedirs(GEN_DIR, exist_ok=True)
 sys.path.insert(0, GEN_DIR)
 
 try:
     import grpc
+except ImportError as exc:
+    raise RuntimeError(
+        "grpcio is not installed. Run: python -m pip install -r requirements.txt"
+    ) from exc
+
+try:
     # pyrefly: ignore [missing-import]
     import image_ingestion_pb2
     # pyrefly: ignore [missing-import]
     import image_ingestion_pb2_grpc
-except ImportError:
+except ModuleNotFoundError as exc:
+    if exc.name not in {"image_ingestion_pb2", "image_ingestion_pb2_grpc"}:
+        raise
     # Try compiling protobuf definitions first
     # pyrefly: ignore [missing-import]
     from grpc_tools import protoc
     logger.info("Compiling Protobuf definitions in client...")
-    if not os.path.exists(GEN_DIR):
-        os.makedirs(GEN_DIR)
-    protoc.main((
+    result = protoc.main((
         '',
         f'-I{PROTO_DIR}',
         f'--python_out={GEN_DIR}',
         f'--grpc_python_out={GEN_DIR}',
         PROTO_FILE,
     ))
-    import grpc
+    if result != 0:
+        raise RuntimeError(
+            f"Protobuf compilation failed with exit code {result}: {PROTO_FILE}"
+        ) from exc
+    importlib.invalidate_caches()
     # pyrefly: ignore [missing-import]
     import image_ingestion_pb2
     # pyrefly: ignore [missing-import]
