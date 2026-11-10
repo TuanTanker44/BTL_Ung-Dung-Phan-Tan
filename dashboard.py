@@ -152,7 +152,7 @@ def fetch_dashboard_data(detection_mode):
                 v.vehicle_type_name AS vehicle_type_name,
                 sum(f.count) AS total_count,
                 avg(f.count) AS avg_count
-            FROM fact_traffic_flow f
+            FROM (SELECT * FROM fact_traffic_flow FINAL) AS f
             JOIN (SELECT * FROM dim_cameras FINAL) AS c ON f.camera_id = c.camera_id
             JOIN (SELECT * FROM dim_vehicles FINAL) AS v ON f.vehicle_type_id = v.vehicle_type_id
             WHERE f.detection_mode = {mode:String}
@@ -165,7 +165,7 @@ def fetch_dashboard_data(detection_mode):
                 camera_id,
                 congestion_level,
                 count(distinct event_id) AS frame_count
-            FROM fact_traffic_flow
+            FROM fact_traffic_flow FINAL
             WHERE detection_mode = {mode:String}
             GROUP BY camera_id, congestion_level
         """, parameters={"mode": detection_mode})
@@ -178,7 +178,7 @@ def fetch_dashboard_data(detection_mode):
                 c.location AS location,
                 sumIf(f.count, f.vehicle_type_id IN (1, 2, 3, 4)) AS total_vehicles,
                 avg(f.inference_time_ms) AS avg_inference
-            FROM fact_traffic_flow f
+            FROM (SELECT * FROM fact_traffic_flow FINAL) AS f
             JOIN (SELECT * FROM dim_cameras FINAL) AS c
                 ON f.camera_id = c.camera_id
             WHERE f.detection_mode = {mode:String}
@@ -200,7 +200,7 @@ def fetch_dashboard_data(detection_mode):
                 f.congestion_level AS congestion_level,
                 sumIf(f.count, f.vehicle_type_id IN (1, 2, 3, 4)) AS total_vehicles
             FROM (SELECT * FROM dim_images FINAL) AS img
-            JOIN fact_traffic_flow f
+            JOIN (SELECT * FROM fact_traffic_flow FINAL) AS f
                 ON img.image_id = f.image_id
             JOIN (SELECT * FROM dim_cameras FINAL) AS c
                 ON f.camera_id = c.camera_id
@@ -502,7 +502,7 @@ else:
                         client = get_ch_client()
                         counts_df = client.query_df("""
                             SELECT v.vehicle_type_name as `Loại Xe`, f.count as `Số Lượng`
-                            FROM fact_traffic_flow f
+                            FROM (SELECT * FROM fact_traffic_flow FINAL) AS f
                             JOIN (SELECT * FROM dim_vehicles FINAL) AS v ON f.vehicle_type_id = v.vehicle_type_id
                             WHERE f.image_id = {image_id:String}
                               AND f.detection_mode = {mode:String}

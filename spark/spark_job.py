@@ -430,9 +430,9 @@ def save_to_clickhouse(events, traffic_results, detection_mode):
     Save image metadata and traffic results to ClickHouse.
 
     Avoid inserting existing image IDs and existing
-    (event_id, vehicle_type_id) pairs.
-
-    Intended for a single active pipeline writer.
+    (event_id, vehicle_type_id) pairs. The fact table is a
+    ReplacingMergeTree keyed by that pair, so concurrent writers remain
+    logically idempotent when read with FINAL.
     """
     import clickhouse_connect
 
@@ -476,7 +476,7 @@ def save_to_clickhouse(events, traffic_results, detection_mode):
         existing_facts_result = client.query(
             """
             SELECT DISTINCT event_id, vehicle_type_id, detection_mode
-            FROM fact_traffic_flow
+            FROM fact_traffic_flow FINAL
             WHERE event_id IN {ids:Array(String)}
             """,
             parameters={"ids": event_ids}
@@ -591,7 +591,7 @@ def save_to_clickhouse(events, traffic_results, detection_mode):
         verification_result = client.query(
             """
             SELECT event_id, vehicle_type_id
-            FROM fact_traffic_flow
+            FROM fact_traffic_flow FINAL
             WHERE event_id IN {ids:Array(String)}
             GROUP BY event_id, vehicle_type_id
             """,
@@ -642,7 +642,7 @@ def get_completed_event_ids(event_ids):
         result = client.query(
             """
             SELECT event_id
-            FROM fact_traffic_flow
+            FROM fact_traffic_flow FINAL
             WHERE event_id IN {ids:Array(String)}
             GROUP BY event_id
             HAVING uniqExact(vehicle_type_id) = 5

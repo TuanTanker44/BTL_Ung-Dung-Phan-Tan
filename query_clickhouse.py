@@ -50,9 +50,9 @@ def main():
                 v.vehicle_type_name,
                 SUM(f.count) as total_count,
                 ROUND(AVG(f.count), 2) as avg_count_per_frame
-            FROM fact_traffic_flow f
-            JOIN dim_cameras c ON f.camera_id = c.camera_id
-            JOIN dim_vehicles v ON f.vehicle_type_id = v.vehicle_type_id
+            FROM (SELECT * FROM fact_traffic_flow FINAL) AS f
+            JOIN (SELECT * FROM dim_cameras FINAL) AS c ON f.camera_id = c.camera_id
+            JOIN (SELECT * FROM dim_vehicles FINAL) AS v ON f.vehicle_type_id = v.vehicle_type_id
             GROUP BY f.camera_id, c.location, v.vehicle_type_name
             ORDER BY f.camera_id, total_count DESC
         """
@@ -67,7 +67,7 @@ def main():
                 congestion_level,
                 COUNT(DISTINCT event_id) as total_frames,
                 toString(ROUND(100.0 * COUNT(DISTINCT event_id) / SUM(COUNT(DISTINCT event_id)) OVER (PARTITION BY camera_id), 2)) || '%' as percentage
-            FROM fact_traffic_flow
+            FROM fact_traffic_flow FINAL
             GROUP BY camera_id, congestion_level
             ORDER BY camera_id, total_frames DESC
         """
@@ -84,8 +84,8 @@ def main():
                 f.count,
                 f.congestion_level,
                 f.inference_time_ms
-            FROM fact_traffic_flow f
-            JOIN dim_vehicles v ON f.vehicle_type_id = v.vehicle_type_id
+            FROM (SELECT * FROM fact_traffic_flow FINAL) AS f
+            JOIN (SELECT * FROM dim_vehicles FINAL) AS v ON f.vehicle_type_id = v.vehicle_type_id
             ORDER BY f.timestamp DESC, f.camera_id
             LIMIT 10
         """)

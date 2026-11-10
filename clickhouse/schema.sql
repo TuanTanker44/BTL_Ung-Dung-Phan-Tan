@@ -41,8 +41,10 @@ CREATE TABLE IF NOT EXISTS fact_traffic_flow (
     image_id String,
     inference_time_ms UInt32,
     detection_mode LowCardinality(String) DEFAULT 'unknown'
-) ENGINE = MergeTree()
-ORDER BY (camera_id, timestamp, vehicle_type_id);
+) ENGINE = ReplacingMergeTree()
+-- One logical row per event/category. Concurrent retries may temporarily create
+-- physical versions; queries use FINAL so only one version contributes to KPIs.
+ORDER BY (event_id, vehicle_type_id);
 
 -- Populate static dimension data for vehicles
 INSERT INTO dim_vehicles (vehicle_type_id, vehicle_type_name) VALUES
