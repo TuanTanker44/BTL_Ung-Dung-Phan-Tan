@@ -29,6 +29,9 @@ RUN uv python install 3.11 \
        "clickhouse-connect>=0.7,<1" \
        "Pillow>=10,<12"
 
+RUN /home/airflow/spark-venv/bin/python -c \
+    "import clickhouse_connect, minio, pika, PIL, pyspark; assert pyspark.__version__ == '3.4.1'; print('Spark driver dependencies OK')"
+
 ENV SPARK_HOME=/home/airflow/spark-venv/lib/python3.11/site-packages/pyspark
 ENV PYSPARK_DRIVER_PYTHON=/home/airflow/spark-venv/bin/python
 ENV PYSPARK_PYTHON=/opt/bitnami/python/bin/python

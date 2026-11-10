@@ -28,7 +28,7 @@ RUN /opt/bitnami/python/bin/python -m pip uninstall -y \
 
 # Kiem tra import
 RUN /opt/bitnami/python/bin/python -c \
-    "import torch; import cv2; import ultralytics; print('YOLO dependencies OK')"
+    "import clickhouse_connect, cv2, minio, pika, PIL, pyspark, torch, ultralytics; assert pyspark.__version__ == '3.4.1'; print('Spark worker dependencies OK')"
 
 ENV PYSPARK_PYTHON=/opt/bitnami/python/bin/python
 ENV PYSPARK_DRIVER_PYTHON=/opt/bitnami/python/bin/python
